@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "sam-proxy",
+  "name": "sb-analytics",
   "main": "worker.js",
   "compatibility_date": "2025-09-23",
   "compatibility_flags": ["nodejs_compat"],
