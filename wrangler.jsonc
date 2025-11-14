@@ -6,6 +6,10 @@
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
 
+  "routes": [
+    { "pattern": "api.fedproposal.com/sb/*", "zone_name": "fedproposal.com" }
+  ],
+
   "hyperdrive": [
     { "binding": "HYPERDRIVE", "id": "8ed173cf604a4ff7aa9f16ef4a5b105e" }
   ]
