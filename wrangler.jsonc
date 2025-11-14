@@ -1,0 +1,14 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "sam-proxy",
+  "main": "worker.js",
+  "compatibility_date": "2025-09-23",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  "hyperdrive": [
+    {
+      "binding": "HYPERDRIVE",
+      "id": "8ed173cf604a4ff7aa9f16ef4a5b105e"
+    }
+  ]
+}
