@@ -2,9 +2,17 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "sb-analytics",
   "main": "worker.js",
-  "compatibility_date": "2025-09-23",
-  "compatibility_flags": ["nodejs_compat"],
+  "compatibility_date": "2025-02-04",
   "observability": { "enabled": true },
+
+  "routes": [
+    { "pattern": "api.fedproposal.com/sb/*", "custom_domain": true }
+  ],
+
+  "vars": {
+    "ALLOWED_ORIGINS": "https://fedproposal.com https://www.fedproposal.com https://api.fedproposal.com https://app.framer.com https://fedproposal.framer.website https://framerusercontent.com"
+  },
+
   "hyperdrive": [
     {
       "binding": "HYPERDRIVE",
