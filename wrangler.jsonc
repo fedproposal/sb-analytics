@@ -6,7 +6,7 @@
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
 
-  "routes": [
+  "route": [
     { "pattern": "api.fedproposal.com/sb/*", "zone_name": "fedproposal.com" }
   ],
 
