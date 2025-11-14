@@ -1,14 +1,10 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "sb-analytics",
-  "main": "src/worker.js",
+  "main": "worker.js",
   "compatibility_date": "2025-02-04",
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
-
-  "routes": [
-    { "pattern": "api.fedproposal.com/sb/*", "zone_name": "fedproposal.com" }
-  ],
 
   "hyperdrive": [
     { "binding": "HYPERDRIVE", "id": "8ed173cf604a4ff7aa9f16ef4a5b105e" }
