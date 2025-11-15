@@ -1,66 +1,95 @@
 // worker.js — sb-analytics
 import { Client } from "pg";
 
-// ---------- CORS helper ----------
+// CORS helper
 function cors(origin, env) {
   const list = (env?.CORS_ALLOW_ORIGINS || "")
     .split(",")
-    .map((s) => s.trim())
+    .map(s => s.trim())
     .filter(Boolean);
-
   const allow =
     list.length === 0 || list.includes("*")
       ? origin || "*"
       : list.includes(origin)
       ? origin
       : list[0];
-
   return {
     "Access-Control-Allow-Origin": allow || "*",
-    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
     "Access-Control-Max-Age": "86400",
-    "Cache-Control": "no-store",
     Vary: "Origin",
   };
 }
 
-// ---------- DB client via Hyperdrive ----------
-function makeClient(env) {
-  return new Client({
+const SB_API_BASE = "https://api.fedproposal.com/sb";
+
+// ---------- Helpers ----------
+
+async function makePgClient(env) {
+  const client = new Client({
     connectionString: env.HYPERDRIVE.connectionString,
     ssl: { rejectUnauthorized: false },
   });
+  await client.connect();
+  return client;
 }
 
-/**
- * ========================= COLUMN MAPPING =========================
- *
- * These names are taken directly from:
- *   public.usaspending_awards_v1
- */
-const USA_TABLE = "public.usaspending_awards_v1";
+async function callOpenAI(env, prompt, data) {
+  const apiKey = env.OPENAI_API_KEY;
+  if (!apiKey) {
+    throw new Error("OPENAI_API_KEY is not configured in Cloudflare env");
+  }
 
-const COL = {
-  // Date the current period of performance ends (DATE)
-  END_DATE: "pop_current_end_date",
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: "gpt-4.1-mini",
+      temperature: 0.2,
+      max_tokens: 500,
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a federal contracts analyst for a business development team. " +
+            "You receive structured USAspending-style JSON for a single contract award, " +
+            "plus its modification history and any subawards. " +
+            "Write a concise, plain-English analysis that a small-business capture manager can act on.",
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text:
+                prompt +
+                "\n\nHere is the contract data as JSON. Do NOT echo the raw JSON, just reason over it.\n",
+            },
+            {
+              type: "input_json",
+              input_json: data,
+            },
+          ],
+        },
+      ],
+    }),
+  });
 
-  // NAICS code (TEXT)
-  NAICS: "naics_code",
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(json?.error?.message || `OpenAI HTTP ${res.status}`);
+  }
+  const text =
+    json.choices?.[0]?.message?.content ||
+    "No analysis text returned from model.";
+  return text;
+}
 
-  // Awarding agency name (TEXT)
-  AGENCY: "awarding_agency_name",
-
-  // PIID / contract id (TEXT)
-  PIID: "award_id_piid",
-
-  // Award key / identifier (TEXT)
-  AWARD_ID: "award_key",
-
-  // Current total value of award (NUMERIC)
-  VALUE: "current_total_value_of_award_num",
-};
-/* ================================================================= */
+// ---------- Main Worker ----------
 
 export default {
   async fetch(request, env, ctx) {
@@ -73,10 +102,9 @@ export default {
       return new Response(null, { status: 204, headers });
     }
 
-    // Normalize path: strip optional leading /sb
     const path = url.pathname.replace(/^\/sb(\/|$)/, "/");
 
-    // ---------- Health ----------
+    // Simple health
     if (path === "/health") {
       return new Response(JSON.stringify({ ok: true, db: true }), {
         status: 200,
@@ -84,21 +112,19 @@ export default {
       });
     }
 
-    /* =============================================================
-     * 1) SB Agency Share (existing)
-     *    GET /sb/agency-share?fy=2026&limit=12
-     * =========================================================== */
-    if (path === "/agency-share") {
+    // ==========================
+    //  SB Agency Share (existing)
+    // ==========================
+    if (path === "/agency-share" && request.method === "GET") {
       const fy = parseInt(url.searchParams.get("fy") || "2026", 10);
       const limit = Math.max(
         1,
         Math.min(50, parseInt(url.searchParams.get("limit") || "12", 10))
       );
 
-      const client = makeClient(env);
+      const client = await makePgClient(env);
 
       try {
-        await client.connect();
         const sql = `
           SELECT agency, sb_share_pct, dollars_total
           FROM public.sb_agency_share
@@ -109,7 +135,7 @@ export default {
         const { rows } = await client.query(sql, [fy, limit]);
         ctx.waitUntil(client.end());
 
-        const data = rows.map((r) => ({
+        const data = rows.map(r => ({
           agency: r.agency,
           sb_share_pct:
             typeof r.sb_share_pct === "number"
@@ -131,100 +157,189 @@ export default {
         } catch {}
         return new Response(
           JSON.stringify({ ok: false, error: e?.message || "query failed" }),
-          { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
+          {
+            status: 500,
+            headers: { ...headers, "Content-Type": "application/json" },
+          }
         );
       }
     }
 
-    /* =============================================================
-     * 2) Expiring Contracts (NEW)
-     *    GET /sb/expiring-contracts?naics=541519&agency=Veterans%20Affairs&window_days=180&limit=50
-     * =========================================================== */
-    if (path === "/expiring-contracts") {
-      const naicsParam = (url.searchParams.get("naics") || "").trim();
-      const agencyFilter = (url.searchParams.get("agency") || "").trim();
-      const windowDays = Math.max(
-        1,
-        Math.min(365, parseInt(url.searchParams.get("window_days") || "180", 10))
-      );
-      const limit = Math.max(
-        1,
-        Math.min(200, parseInt(url.searchParams.get("limit") || "100", 10))
-      );
+    // ============================================
+    //  NEW: /contracts/insights  (POST, JSON body)
+    // ============================================
+    if (path === "/contracts/insights" && request.method === "POST") {
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return new Response(
+          JSON.stringify({ ok: false, error: "Invalid JSON body" }),
+          {
+            status: 400,
+            headers: { ...headers, "Content-Type": "application/json" },
+          }
+        );
+      }
 
-      const naicsList =
-        naicsParam.length > 0
-          ? naicsParam
-              .split(",")
-              .map((s) => s.trim())
-              .filter(Boolean)
-          : [];
+      const piid = String(body.piid || "").trim();
+      if (!piid) {
+        return new Response(
+          JSON.stringify({ ok: false, error: "Missing piid" }),
+          {
+            status: 400,
+            headers: { ...headers, "Content-Type": "application/json" },
+          }
+        );
+      }
 
-      const client = makeClient(env);
+      const client = await makePgClient(env);
 
       try {
-        await client.connect();
-
-        const sql = `
+        // Main award row (latest action for this PIID)
+        const awardRes = await client.query(
+          `
           SELECT
-            ${COL.PIID}     AS piid,
-            ${COL.AWARD_ID} AS award_key,
-            ${COL.AGENCY}   AS agency,
-            ${COL.NAICS}    AS naics,
-            ${COL.END_DATE} AS end_date,
-            ${COL.VALUE}    AS value
-          FROM ${USA_TABLE}
-          WHERE
-            ${COL.END_DATE} >= CURRENT_DATE
-            AND ${COL.END_DATE} < CURRENT_DATE + $1::int
-            AND (
-              $2::text IS NULL
-              OR ${COL.AGENCY} ILIKE '%' || $2 || '%'
-            )
-            AND (
-              $3::text[] IS NULL
-              OR ${COL.NAICS} = ANY($3)
-            )
-          ORDER BY ${COL.END_DATE} ASC
-          LIMIT $4
-        `;
+            award_id_piid,
+            award_type,
+            awarding_agency_name,
+            awarding_office_name,
+            funding_agency_name,
+            naics_code,
+            naics_description,
+            recipient_name,
+            recipient_uei,
+            recipient_duns,
+            federal_action_obligation_num,
+            current_total_value_of_award_num,
+            potential_total_value_of_award_num,
+            total_dollars_obligated_num,
+            pop_start_date,
+            pop_current_end_date,
+            pop_potential_end_date,
+            action_date,
+            action_fy
+          FROM public.usaspending_awards_v1
+          WHERE award_id_piid = $1
+          ORDER BY action_date DESC
+          LIMIT 1
+        `,
+          [piid]
+        );
 
-        const params = [
-          windowDays,                        // $1
-          agencyFilter || null,              // $2
-          naicsList.length ? naicsList : null, // $3
-          limit,                             // $4
-        ];
+        if (!awardRes.rows.length) {
+          return new Response(
+            JSON.stringify({
+              ok: false,
+              error: `No award found for PIID ${piid}`,
+            }),
+            {
+              status: 404,
+              headers: { ...headers, "Content-Type": "application/json" },
+            }
+          );
+        }
 
-        const { rows } = await client.query(sql, params);
+        const award = awardRes.rows[0];
+
+        // Mod history (all actions for this PIID)
+        const modsRes = await client.query(
+          `
+          SELECT
+            action_date,
+            action_fy,
+            federal_action_obligation_num,
+            total_dollars_obligated_num,
+            current_total_value_of_award_num
+          FROM public.usaspending_awards_v1
+          WHERE award_id_piid = $1
+          ORDER BY action_date ASC
+          LIMIT 50
+        `,
+          [piid]
+        );
+
+        const mods = modsRes.rows || [];
+
+        // Optional: subawards (adjust column names if needed)
+        let subs = [];
+        try {
+          const subRes = await client.query(
+            `
+            SELECT
+              award_id_piid,
+              subaward_amount_num,
+              subaward_recipient_name,
+              subaward_action_date
+            FROM public.usaspending_contract_subawards
+            WHERE award_id_piid = $1
+            ORDER BY subaward_action_date ASC
+            LIMIT 50
+          `,
+            [piid]
+          );
+          subs = subRes.rows || [];
+        } catch (e) {
+          // If the table/columns don't exist yet, just ignore subawards.
+          subs = [];
+        }
+
         ctx.waitUntil(client.end());
 
-        const data = rows.map((r) => ({
-          piid: r.piid,
-          award_key: r.award_key,
-          agency: r.agency,
-          naics: r.naics,
-          end_date: r.end_date,
-          value:
-            typeof r.value === "number" ? r.value : Number(r.value),
-        }));
+        // Build compact data blob to send to OpenAI
+        const aiData = {
+          award,
+          mods,
+          subs,
+        };
 
-        return new Response(JSON.stringify({ ok: true, rows: data }), {
-          status: 200,
-          headers: { ...headers, "Content-Type": "application/json" },
-        });
+        const prompt =
+          "Using the contract award data, modification history, and any subawards, " +
+          "write a concise 2–3 paragraph analysis for a small-business capture manager.\n\n" +
+          "Cover at least:\n" +
+          "1) Who the incumbent is (name, and whether it *appears* to be small or large if evident).\n" +
+          "2) Rough size of the contract (obligated and potential value) and remaining time in the period of performance.\n" +
+          "3) Any interesting modification patterns (many mods? large funding spikes? apparent bridge/extension?).\n" +
+          "4) When the recompete window is likely (base/option dates; if PoP end is within 12–24 months, call that out).\n" +
+          "5) Any obvious capture angles or risks for a challenger (e.g., heavy incumbent concentration, lots of subs, etc.).\n\n" +
+          "Do NOT guess specific NAICS size standards or certification status. If something is not in the data, say so plainly.";
+
+        const summaryText = await callOpenAI(env, prompt, aiData);
+
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            piid,
+            summary: summaryText,
+            meta: {
+              hasMods: !!mods.length,
+              modsCount: mods.length,
+              subsCount: subs.length,
+            },
+          }),
+          {
+            status: 200,
+            headers: { ...headers, "Content-Type": "application/json" },
+          }
+        );
       } catch (e) {
         try {
           await client.end();
         } catch {}
         return new Response(
-          JSON.stringify({ ok: false, error: e?.message || "query failed" }),
-          { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
+          JSON.stringify({
+            ok: false,
+            error: e?.message || "contract insights failed",
+          }),
+          {
+            status: 500,
+            headers: { ...headers, "Content-Type": "application/json" },
+          }
         );
       }
     }
 
-    // ---------- Fallback ----------
+    // Fallback
     return new Response("Not found", { status: 404, headers });
   },
 };
