@@ -6,9 +6,8 @@
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
 
-  "route": [
-    { "pattern": "api.fedproposal.com/sb/*", "zone_name": "fedproposal.com" }
-  ],
+  // Routes are managed in the Cloudflare dashboard.
+  // No "route" field here to avoid Wrangler config errors.
 
   "hyperdrive": [
     { "binding": "HYPERDRIVE", "id": "8ed173cf604a4ff7aa9f16ef4a5b105e" }
