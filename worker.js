@@ -48,12 +48,17 @@ export default {
       });
     }
 
-    // ---------- NEW: AI search endpoint ----------
-    // URL: https://api.fedproposal.com/sb/ai/search?q=...&source=...&limit=...
+    // ---------- NEW: AI search endpoint (forecasts + SAM only for now) ----------
+    // URL: https://api.fedproposal.com/sb/ai/search?q=...&source=forecast|sam_notice&limit=...
     if (path === "/ai/search") {
       const q = (url.searchParams.get("q") || "").trim();
-      const sourceParam = (url.searchParams.get("source") || "").trim();
-      const source = sourceParam || null;
+      let source = (url.searchParams.get("source") || "").trim();
+
+      // Default to forecasts if not provided
+      if (!source) {
+        source = "forecast";
+      }
+
       const limitParam = parseInt(url.searchParams.get("limit") || "20", 10);
       const limit = Number.isFinite(limitParam)
         ? Math.min(Math.max(limitParam, 1), 50)
@@ -64,6 +69,27 @@ export default {
           JSON.stringify({ ok: false, error: "Missing q parameter" }),
           { status: 400, headers: { ...headers, "Content-Type": "application/json" } }
         );
+      }
+
+      // For now, don't allow direct USAspending search (too big / slow without indexing).
+      if (source === "usaspending_contract_award") {
+        return new Response(
+          JSON.stringify({
+            ok: false,
+            error:
+              "Direct USAspending AI search is not enabled yet. Try source=forecast or source=sam_notice.",
+          }),
+          { status: 400, headers: { ...headers, "Content-Type": "application/json" } }
+        );
+      }
+
+      // Choose which AI view to query based on source
+      let table = "ai_forecasts_v1";
+      if (source === "sam_notice") {
+        table = "ai_sam_notices_v1";
+      } else {
+        // Treat anything else as "forecast" for now
+        source = "forecast";
       }
 
       const client = new Client({
@@ -82,15 +108,13 @@ export default {
             agency,
             naics_code,
             LEFT(doc_text, 4000) AS doc_text
-          FROM ai_corpus_v1
-          WHERE
-            ($1::text IS NULL OR source = $1::text)
-            AND doc_text ILIKE '%' || $2::text || '%'
+          FROM ${table}
+          WHERE doc_text ILIKE '%' || $1::text || '%'
           ORDER BY doc_date DESC NULLS LAST
-          LIMIT $3::int
+          LIMIT $2::int
         `;
 
-        const { rows } = await client.query(sql, [source, q, limit]);
+        const { rows } = await client.query(sql, [q, limit]);
 
         ctx.waitUntil(client.end());
 
