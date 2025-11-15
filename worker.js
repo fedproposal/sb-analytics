@@ -37,6 +37,7 @@ export default {
     // Normalize path: strip an optional leading `/sb`
     // "/sb/agency-share" -> "/agency-share"
     // "/agency-share"    -> "/agency-share"
+    // "/sb/ai/search"    -> "/ai/search"
     const path = url.pathname.replace(/^\/sb(\/|$)/, "/");
 
     // Simple health
@@ -47,6 +48,72 @@ export default {
       });
     }
 
+    // ---------- NEW: AI search endpoint ----------
+    // URL: https://api.fedproposal.com/sb/ai/search?q=...&source=...&limit=...
+    if (path === "/ai/search") {
+      const q = (url.searchParams.get("q") || "").trim();
+      const sourceParam = (url.searchParams.get("source") || "").trim();
+      const source = sourceParam || null;
+      const limitParam = parseInt(url.searchParams.get("limit") || "20", 10);
+      const limit = Number.isFinite(limitParam)
+        ? Math.min(Math.max(limitParam, 1), 50)
+        : 20;
+
+      if (!q) {
+        return new Response(
+          JSON.stringify({ ok: false, error: "Missing q parameter" }),
+          { status: 400, headers: { ...headers, "Content-Type": "application/json" } }
+        );
+      }
+
+      const client = new Client({
+        connectionString: env.HYPERDRIVE.connectionString,
+        ssl: { rejectUnauthorized: false },
+      });
+
+      try {
+        await client.connect();
+
+        const sql = `
+          SELECT
+            doc_id,
+            source,
+            doc_date,
+            agency,
+            naics_code,
+            LEFT(doc_text, 4000) AS doc_text
+          FROM ai_corpus_v1
+          WHERE
+            ($1::text IS NULL OR source = $1::text)
+            AND doc_text ILIKE '%' || $2::text || '%'
+          ORDER BY doc_date DESC NULLS LAST
+          LIMIT $3::int
+        `;
+
+        const { rows } = await client.query(sql, [source, q, limit]);
+
+        ctx.waitUntil(client.end());
+
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            query: { q, source, limit },
+            rows,
+          }),
+          { status: 200, headers: { ...headers, "Content-Type": "application/json" } }
+        );
+      } catch (e) {
+        try {
+          await client.end();
+        } catch {}
+        return new Response(
+          JSON.stringify({ ok: false, error: e?.message || "search failed" }),
+          { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
+        );
+      }
+    }
+
+    // ---------- Existing: SB agency share endpoint ----------
     if (path === "/agency-share") {
       const fy = parseInt(url.searchParams.get("fy") || "2026", 10);
       const limit = Math.max(
@@ -88,7 +155,9 @@ export default {
           headers: { ...headers, "Content-Type": "application/json" },
         });
       } catch (e) {
-        try { await client.end(); } catch {}
+        try {
+          await client.end();
+        } catch {}
         return new Response(
           JSON.stringify({ ok: false, error: e?.message || "query failed" }),
           { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
