@@ -31,6 +31,62 @@ function createClient(env) {
   });
 }
 
+// Simple keyword extractor for Ask AI
+function extractKeywords(text) {
+  const cleaned = text
+    .toLowerCase()
+    .replace(/[^\w\s]/g, " "); // remove punctuation
+
+  const words = cleaned
+    .split(/\s+/)
+    .map(w => w.trim())
+    .filter(Boolean);
+
+  const stopwords = new Set([
+    "the",
+    "and",
+    "for",
+    "with",
+    "what",
+    "when",
+    "where",
+    "who",
+    "why",
+    "how",
+    "are",
+    "is",
+    "about",
+    "any",
+    "a",
+    "an",
+    "of",
+    "to",
+    "on",
+    "in",
+    "my",
+    "our",
+    "does",
+    "do",
+    "can",
+    "you",
+    "we",
+    "it",
+    "this",
+    "that",
+    "these",
+    "those",
+  ]);
+
+  const candidates = words.filter(w => w.length >= 4 && !stopwords.has(w));
+  const unique = [];
+  for (const w of candidates) {
+    if (!unique.includes(w)) unique.push(w);
+  }
+
+  // Limit to top 3 keywords to keep SQL simple/fast
+  return unique.slice(0, 3);
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -152,7 +208,7 @@ export default {
       }
     }
 
-    // ---------- AI ASK (uses the same views + OpenAI) ----------
+    // ---------- AI ASK (uses the same views + OpenAI, with keyword search) ----------
     // POST https://api.fedproposal.com/sb/ai/ask
     // body: { question: string, source?: "forecast" | "sam_notice", limit?: number }
     if (path === "/ai/ask" && request.method === "POST") {
@@ -202,10 +258,26 @@ export default {
         source = "forecast";
       }
 
+      // Build keyword list for the SQL query
+      let keywords = extractKeywords(question);
+      if (keywords.length === 0) {
+        // fallback: use first non-empty word
+        const first = question.split(/\s+/).find(Boolean);
+        if (first) keywords = [first.toLowerCase()];
+      }
+
       const client = createClient(env);
 
       try {
         await client.connect();
+
+        // Build WHERE clause: doc_text ILIKE '%kw1%' AND '%kw2%' ...
+        const clauses = keywords.map(
+          (_, idx) => `doc_text ILIKE '%' || $${idx + 1}::text || '%'`
+        );
+        const whereClause = clauses.length
+          ? clauses.join(" AND ")
+          : "TRUE";
 
         const sql = `
           SELECT
@@ -216,13 +288,13 @@ export default {
             naics_code,
             LEFT(doc_text, 2000) AS doc_text
           FROM ${table}
-          WHERE doc_text ILIKE '%' || $1::text || '%'
+          WHERE ${whereClause}
           ORDER BY doc_date DESC NULLS LAST
-          LIMIT $2::int
+          LIMIT $${keywords.length + 1}::int
         `;
 
-        // Use the *question* itself as the keyword term for now
-        const { rows } = await client.query(sql, [question, limit]);
+        const params = [...keywords, limit];
+        const { rows } = await client.query(sql, params);
         ctx.waitUntil(client.end());
 
         // Build context text for the AI
@@ -302,6 +374,7 @@ export default {
             ok: true,
             source,
             question,
+            keywords,
             answer,
             refs: rows.map(r => ({
               doc_id: r.doc_id,
