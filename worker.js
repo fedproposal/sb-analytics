@@ -1,21 +1,23 @@
-// worker.js — sb-analytics (root + /sb path support)
+// worker.js — sb-analytics
 import { Client } from "pg";
 
-// CORS helper
+// ---------- CORS helper ----------
 function cors(origin, env) {
   const list = (env?.CORS_ALLOW_ORIGINS || "")
     .split(",")
-    .map(s => s.trim())
+    .map((s) => s.trim())
     .filter(Boolean);
+
   const allow =
     list.length === 0 || list.includes("*")
       ? origin || "*"
       : list.includes(origin)
       ? origin
       : list[0];
+
   return {
     "Access-Control-Allow-Origin": allow || "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
     "Access-Control-Max-Age": "86400",
     "Cache-Control": "no-store",
@@ -23,69 +25,45 @@ function cors(origin, env) {
   };
 }
 
-// Helper: create PG client
-function createClient(env) {
+// ---------- DB client via Hyperdrive ----------
+function makeClient(env) {
   return new Client({
     connectionString: env.HYPERDRIVE.connectionString,
     ssl: { rejectUnauthorized: false },
   });
 }
 
-// Simple keyword extractor for Ask AI
-function extractKeywords(text) {
-  const cleaned = text
-    .toLowerCase()
-    .replace(/[^\w\s]/g, " "); // remove punctuation
+/**
+ * ========================= COLUMN MAPPING =========================
+ *
+ * Change ONLY this block if your Neon column names differ.
+ * Run the information_schema query I gave you, then plug in
+ * your actual column names below.
+ *
+ * TABLE: public.usaspending_awards_v1
+ */
+const USA_TABLE = "public.usaspending_awards_v1";
 
-  const words = cleaned
-    .split(/\s+/)
-    .map(w => w.trim())
-    .filter(Boolean);
+const COL = {
+  // Date the current period of performance ends (DATE)
+  END_DATE: "period_of_performance_current_end_date",
 
-  const stopwords = new Set([
-    "the",
-    "and",
-    "for",
-    "with",
-    "what",
-    "when",
-    "where",
-    "who",
-    "why",
-    "how",
-    "are",
-    "is",
-    "about",
-    "any",
-    "a",
-    "an",
-    "of",
-    "to",
-    "on",
-    "in",
-    "my",
-    "our",
-    "does",
-    "do",
-    "can",
-    "you",
-    "we",
-    "it",
-    "this",
-    "that",
-    "these",
-    "those",
-  ]);
+  // NAICS code (TEXT / VARCHAR)
+  NAICS: "naics",
 
-  const candidates = words.filter(w => w.length >= 4 && !stopwords.has(w));
-  const unique = [];
-  for (const w of candidates) {
-    if (!unique.includes(w)) unique.push(w);
-  }
+  // Awarding agency name (TEXT)
+  AGENCY: "awarding_toptier_agency_name",
 
-  // Limit to top 3 keywords to keep SQL simple/fast
-  return unique.slice(0, 3);
-}
+  // PIID / contract id (TEXT)
+  PIID: "piid",
+
+  // Some award identifier (TEXT) — optional fallback
+  AWARD_ID: "award_id",
+
+  // Dollar amount / value of award (NUMERIC)
+  VALUE: "current_total_value_of_award",
+};
+/* ================================================================= */
 
 export default {
   async fetch(request, env, ctx) {
@@ -98,14 +76,10 @@ export default {
       return new Response(null, { status: 204, headers });
     }
 
-    // Normalize path: strip an optional leading `/sb`
-    // "/sb/agency-share" -> "/agency-share"
-    // "/agency-share"    -> "/agency-share"
-    // "/sb/ai/search"    -> "/ai/search"
-    // "/sb/ai/ask"       -> "/ai/ask"
+    // Normalize path: strip optional leading /sb
     const path = url.pathname.replace(/^\/sb(\/|$)/, "/");
 
-    // Simple health
+    // Health
     if (path === "/health") {
       return new Response(JSON.stringify({ ok: true, db: true }), {
         status: 200,
@@ -113,308 +87,18 @@ export default {
       });
     }
 
-    // ---------- AI SEARCH (forecasts + SAM) ----------
-    // GET https://api.fedproposal.com/sb/ai/search?q=...&source=forecast|sam_notice&limit=...
-    if (path === "/ai/search" && request.method === "GET") {
-      const q = (url.searchParams.get("q") || "").trim();
-      let source = (url.searchParams.get("source") || "").trim();
-
-      // Default to forecasts if not provided
-      if (!source) source = "forecast";
-
-      const limitParam = parseInt(url.searchParams.get("limit") || "20", 10);
-      const limit = Number.isFinite(limitParam)
-        ? Math.min(Math.max(limitParam, 1), 50)
-        : 20;
-
-      if (!q) {
-        return new Response(
-          JSON.stringify({ ok: false, error: "Missing q parameter" }),
-          {
-            status: 400,
-            headers: { ...headers, "Content-Type": "application/json" },
-          }
-        );
-      }
-
-      // For now, don't allow direct USAspending search (too big / slow without indexing).
-      if (source === "usaspending_contract_award") {
-        return new Response(
-          JSON.stringify({
-            ok: false,
-            error:
-              "Direct USAspending AI search is not enabled yet. Try source=forecast or source=sam_notice.",
-          }),
-          {
-            status: 400,
-            headers: { ...headers, "Content-Type": "application/json" },
-          }
-        );
-      }
-
-      // Choose which AI view to query based on source
-      let table = "ai_forecasts_v1";
-      if (source === "sam_notice") {
-        table = "ai_sam_notices_v1";
-      } else {
-        source = "forecast";
-      }
-
-      const client = createClient(env);
-
-      try {
-        await client.connect();
-
-        const sql = `
-          SELECT
-            doc_id,
-            source,
-            doc_date,
-            agency,
-            naics_code,
-            LEFT(doc_text, 4000) AS doc_text
-          FROM ${table}
-          WHERE doc_text ILIKE '%' || $1::text || '%'
-          ORDER BY doc_date DESC NULLS LAST
-          LIMIT $2::int
-        `;
-
-        const { rows } = await client.query(sql, [q, limit]);
-
-        ctx.waitUntil(client.end());
-
-        return new Response(
-          JSON.stringify({
-            ok: true,
-            query: { q, source, limit },
-            rows,
-          }),
-          {
-            status: 200,
-            headers: { ...headers, "Content-Type": "application/json" },
-          }
-        );
-      } catch (e) {
-        try {
-          await client.end();
-        } catch {}
-        return new Response(
-          JSON.stringify({ ok: false, error: e?.message || "search failed" }),
-          {
-            status: 500,
-            headers: { ...headers, "Content-Type": "application/json" },
-          }
-        );
-      }
-    }
-
-    // ---------- AI ASK (uses the same views + OpenAI, with keyword search) ----------
-    // POST https://api.fedproposal.com/sb/ai/ask
-    // body: { question: string, source?: "forecast" | "sam_notice", limit?: number }
-    if (path === "/ai/ask" && request.method === "POST") {
-      let body;
-      try {
-        body = await request.json();
-      } catch {
-        body = {};
-      }
-
-      const question = (body.question || "").trim();
-      let source = (body.source || "forecast").trim();
-      const limitParam = parseInt(String(body.limit || "10"), 10);
-      const limit = Number.isFinite(limitParam)
-        ? Math.min(Math.max(limitParam, 1), 10)
-        : 10;
-
-      if (!question) {
-        return new Response(
-          JSON.stringify({ ok: false, error: "Missing question" }),
-          {
-            status: 400,
-            headers: { ...headers, "Content-Type": "application/json" },
-          }
-        );
-      }
-
-      if (!env.OPENAI_API_KEY) {
-        return new Response(
-          JSON.stringify({
-            ok: false,
-            error:
-              "OPENAI_API_KEY is not configured on this worker. Ask AI backend is not ready yet.",
-          }),
-          {
-            status: 500,
-            headers: { ...headers, "Content-Type": "application/json" },
-          }
-        );
-      }
-
-      // For now, restrict to forecast or sam_notice
-      let table = "ai_forecasts_v1";
-      if (source === "sam_notice") {
-        table = "ai_sam_notices_v1";
-      } else {
-        source = "forecast";
-      }
-
-      // Build keyword list for the SQL query
-      let keywords = extractKeywords(question);
-      if (keywords.length === 0) {
-        // fallback: use first non-empty word
-        const first = question.split(/\s+/).find(Boolean);
-        if (first) keywords = [first.toLowerCase()];
-      }
-
-      const client = createClient(env);
-
-      try {
-        await client.connect();
-
-        // Build WHERE clause: doc_text ILIKE '%kw1%' AND '%kw2%' ...
-        const clauses = keywords.map(
-          (_, idx) => `doc_text ILIKE '%' || $${idx + 1}::text || '%'`
-        );
-        const whereClause = clauses.length
-          ? clauses.join(" AND ")
-          : "TRUE";
-
-        const sql = `
-          SELECT
-            doc_id,
-            source,
-            doc_date,
-            agency,
-            naics_code,
-            LEFT(doc_text, 2000) AS doc_text
-          FROM ${table}
-          WHERE ${whereClause}
-          ORDER BY doc_date DESC NULLS LAST
-          LIMIT $${keywords.length + 1}::int
-        `;
-
-        const params = [...keywords, limit];
-        const { rows } = await client.query(sql, params);
-        ctx.waitUntil(client.end());
-
-        // Build context text for the AI
-        const contextPieces = rows.map((r, idx) => {
-          return [
-            `Record ${idx + 1}:`,
-            `  doc_id: ${r.doc_id}`,
-            `  source: ${r.source}`,
-            r.agency ? `  agency: ${r.agency}` : "",
-            r.naics_code ? `  naics_code: ${r.naics_code}` : "",
-            `  content: ${r.doc_text}`,
-          ]
-            .filter(Boolean)
-            .join("\n");
-        });
-
-        const context =
-          contextPieces.length > 0
-            ? contextPieces.join("\n\n---\n\n")
-            : "No matching records were found in the database.";
-
-        // Call OpenAI
-        const messages = [
-          {
-            role: "system",
-            content:
-              "You are a helpful federal government contracts research assistant. " +
-              "You answer questions using the data records provided. " +
-              "When you reference specific data, mention the doc_id and source (forecast or sam_notice). " +
-              "If the data is not available, say that you don't know rather than guessing.",
-          },
-          {
-            role: "user",
-            content:
-              `User question:\n${question}\n\n` +
-              `Relevant data records from the database:\n${context}`,
-          },
-        ];
-
-        const aiRes = await fetch(
-          "https://api.openai.com/v1/chat/completions",
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${env.OPENAI_API_KEY}`,
-            },
-            body: JSON.stringify({
-              model: "gpt-4.1-mini",
-              messages,
-              temperature: 0.2,
-            }),
-          }
-        );
-
-        if (!aiRes.ok) {
-          const errText = await aiRes.text();
-          return new Response(
-            JSON.stringify({
-              ok: false,
-              error: `OpenAI error: HTTP ${aiRes.status} ${errText}`,
-            }),
-            {
-              status: 500,
-              headers: { ...headers, "Content-Type": "application/json" },
-            }
-          );
-        }
-
-        const aiJson = await aiRes.json();
-        const answer =
-          aiJson?.choices?.[0]?.message?.content ||
-          "I was not able to generate an answer.";
-
-        return new Response(
-          JSON.stringify({
-            ok: true,
-            source,
-            question,
-            keywords,
-            answer,
-            refs: rows.map(r => ({
-              doc_id: r.doc_id,
-              source: r.source,
-              doc_date: r.doc_date,
-              agency: r.agency,
-              naics_code: r.naics_code,
-            })),
-          }),
-          {
-            status: 200,
-            headers: { ...headers, "Content-Type": "application/json" },
-          }
-        );
-      } catch (e) {
-        try {
-          await client.end();
-        } catch {}
-        return new Response(
-          JSON.stringify({
-            ok: false,
-            error: e?.message || "ask-ai failed",
-          }),
-          {
-            status: 500,
-            headers: { ...headers, "Content-Type": "application/json" },
-          }
-        );
-      }
-    }
-
-    // ---------- SB agency share endpoint (donut) ----------
-    if (path === "/agency-share" && request.method === "GET") {
+    /* =============================================================
+     * 1) SB Agency Share (existing)
+     *    GET /sb/agency-share?fy=2026&limit=12
+     * =========================================================== */
+    if (path === "/agency-share") {
       const fy = parseInt(url.searchParams.get("fy") || "2026", 10);
       const limit = Math.max(
         1,
         Math.min(50, parseInt(url.searchParams.get("limit") || "12", 10))
       );
 
-      const client = createClient(env);
+      const client = makeClient(env);
 
       try {
         await client.connect();
@@ -428,7 +112,7 @@ export default {
         const { rows } = await client.query(sql, [fy, limit]);
         ctx.waitUntil(client.end());
 
-        const data = rows.map(r => ({
+        const data = rows.map((r) => ({
           agency: r.agency,
           sb_share_pct:
             typeof r.sb_share_pct === "number"
@@ -450,14 +134,100 @@ export default {
         } catch {}
         return new Response(
           JSON.stringify({ ok: false, error: e?.message || "query failed" }),
-          {
-            status: 500,
-            headers: { ...headers, "Content-Type": "application/json" },
-          }
+          { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
         );
       }
     }
 
+    /* =============================================================
+     * 2) Expiring Contracts (NEW)
+     *    GET /sb/expiring-contracts?naics=541519&agency=Veterans%20Affairs&window_days=180&limit=50
+     * =========================================================== */
+    if (path === "/expiring-contracts") {
+      const naicsParam = (url.searchParams.get("naics") || "").trim();
+      const agencyFilter = (url.searchParams.get("agency") || "").trim();
+      const windowDays = Math.max(
+        1,
+        Math.min(365, parseInt(url.searchParams.get("window_days") || "180", 10))
+      );
+      const limit = Math.max(
+        1,
+        Math.min(200, parseInt(url.searchParams.get("limit") || "100", 10))
+      );
+
+      const naicsList =
+        naicsParam.length > 0
+          ? naicsParam
+              .split(",")
+              .map((s) => s.trim())
+              .filter(Boolean)
+          : [];
+
+      const client = makeClient(env);
+
+      try {
+        await client.connect();
+
+        const sql = `
+          SELECT
+            ${COL.PIID}          AS piid,
+            ${COL.AWARD_ID}      AS award_id,
+            ${COL.AGENCY}        AS agency,
+            ${COL.NAICS}         AS naics,
+            ${COL.END_DATE}      AS end_date,
+            ${COL.VALUE}         AS value
+          FROM ${USA_TABLE}
+          WHERE
+            ${COL.END_DATE} >= CURRENT_DATE
+            AND ${COL.END_DATE} < CURRENT_DATE + ($1 || ' days')::interval
+            AND (
+              $2::text IS NULL
+              OR ${COL.AGENCY} ILIKE '%' || $2 || '%'
+            )
+            AND (
+              $3::text[] IS NULL
+              OR ${COL.NAICS} = ANY($3)
+            )
+          ORDER BY ${COL.END_DATE} ASC
+          LIMIT $4
+        `;
+
+        const params = [
+          String(windowDays),
+          agencyFilter || null,
+          naicsList.length ? naicsList : null,
+          limit,
+        ];
+
+        const { rows } = await client.query(sql, params);
+        ctx.waitUntil(client.end());
+
+        const data = rows.map((r) => ({
+          piid: r.piid,
+          award_id: r.award_id,
+          agency: r.agency,
+          naics: r.naics,
+          end_date: r.end_date,
+          value:
+            typeof r.value === "number" ? r.value : Number(r.value),
+        }));
+
+        return new Response(JSON.stringify({ ok: true, rows: data }), {
+          status: 200,
+          headers: { ...headers, "Content-Type": "application/json" },
+        });
+      } catch (e) {
+        try {
+          await client.end();
+        } catch {}
+        return new Response(
+          JSON.stringify({ ok: false, error: e?.message || "query failed" }),
+          { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
+        );
+      }
+    }
+
+    // Fallback
     return new Response("Not found", { status: 404, headers });
   },
 };
