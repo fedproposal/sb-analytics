@@ -36,32 +36,29 @@ function makeClient(env) {
 /**
  * ========================= COLUMN MAPPING =========================
  *
- * Change ONLY this block if your Neon column names differ.
- * Run the information_schema query I gave you, then plug in
- * your actual column names below.
- *
- * TABLE: public.usaspending_awards_v1
+ * These names are taken directly from:
+ *   public.usaspending_awards_v1
  */
 const USA_TABLE = "public.usaspending_awards_v1";
 
 const COL = {
   // Date the current period of performance ends (DATE)
-  END_DATE: "period_of_performance_current_end_date",
+  END_DATE: "pop_current_end_date",
 
-  // NAICS code (TEXT / VARCHAR)
-  NAICS: "naics",
+  // NAICS code (TEXT)
+  NAICS: "naics_code",
 
   // Awarding agency name (TEXT)
-  AGENCY: "awarding_toptier_agency_name",
+  AGENCY: "awarding_agency_name",
 
   // PIID / contract id (TEXT)
-  PIID: "piid",
+  PIID: "award_id_piid",
 
-  // Some award identifier (TEXT) — optional fallback
-  AWARD_ID: "award_id",
+  // Award key / identifier (TEXT)
+  AWARD_ID: "award_key",
 
-  // Dollar amount / value of award (NUMERIC)
-  VALUE: "current_total_value_of_award",
+  // Current total value of award (NUMERIC)
+  VALUE: "current_total_value_of_award_num",
 };
 /* ================================================================= */
 
@@ -79,7 +76,7 @@ export default {
     // Normalize path: strip optional leading /sb
     const path = url.pathname.replace(/^\/sb(\/|$)/, "/");
 
-    // Health
+    // ---------- Health ----------
     if (path === "/health") {
       return new Response(JSON.stringify({ ok: true, db: true }), {
         status: 200,
@@ -170,16 +167,16 @@ export default {
 
         const sql = `
           SELECT
-            ${COL.PIID}          AS piid,
-            ${COL.AWARD_ID}      AS award_id,
-            ${COL.AGENCY}        AS agency,
-            ${COL.NAICS}         AS naics,
-            ${COL.END_DATE}      AS end_date,
-            ${COL.VALUE}         AS value
+            ${COL.PIID}     AS piid,
+            ${COL.AWARD_ID} AS award_key,
+            ${COL.AGENCY}   AS agency,
+            ${COL.NAICS}    AS naics,
+            ${COL.END_DATE} AS end_date,
+            ${COL.VALUE}    AS value
           FROM ${USA_TABLE}
           WHERE
             ${COL.END_DATE} >= CURRENT_DATE
-            AND ${COL.END_DATE} < CURRENT_DATE + ($1 || ' days')::interval
+            AND ${COL.END_DATE} < CURRENT_DATE + $1::int
             AND (
               $2::text IS NULL
               OR ${COL.AGENCY} ILIKE '%' || $2 || '%'
@@ -193,10 +190,10 @@ export default {
         `;
 
         const params = [
-          String(windowDays),
-          agencyFilter || null,
-          naicsList.length ? naicsList : null,
-          limit,
+          windowDays,                        // $1
+          agencyFilter || null,              // $2
+          naicsList.length ? naicsList : null, // $3
+          limit,                             // $4
         ];
 
         const { rows } = await client.query(sql, params);
@@ -204,7 +201,7 @@ export default {
 
         const data = rows.map((r) => ({
           piid: r.piid,
-          award_id: r.award_id,
+          award_key: r.award_key,
           agency: r.agency,
           naics: r.naics,
           end_date: r.end_date,
@@ -227,7 +224,7 @@ export default {
       }
     }
 
-    // Fallback
+    // ---------- Fallback ----------
     return new Response("Not found", { status: 404, headers });
   },
 };
