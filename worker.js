@@ -57,7 +57,7 @@ const COL = {
   // Award key / identifier (TEXT)
   AWARD_ID: "award_key",
 
-  // Current total value of award (NUMERIC)
+  // Use *potential* total value (base + all options) as "Value"
   VALUE: "potential_total_value_of_award_num",
 };
 /* ================================================================= */
@@ -67,48 +67,78 @@ export default {
     const url = new URL(request.url);
     const origin = request.headers.get("Origin") || "";
     const headers = cors(origin, env);
-// Add Agencies to List to choose from
-    if (path === "/agencies") {
-  const client = makeClient(env)
-  try {
-    await client.connect()
-    const sql = `
-      SELECT DISTINCT awarding_agency_name AS agency
-      FROM public.usaspending_awards_v1
-      WHERE awarding_agency_name IS NOT NULL
-      ORDER BY awarding_agency_name
-      LIMIT 200
-    `;
-    const { rows } = await client.query(sql)
-    return new Response(
-      JSON.stringify({ ok: true, rows }),
-      { status: 200, headers: { ...headers, "Content-Type": "application/json" } }
-    )
-  } catch (e: any) {
-    try { await client.end() } catch {}
-    return new Response(
-      JSON.stringify({ ok: false, error: e?.message || "query failed" }),
-      { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
-    )
-  } finally {
-    try { await client.end() } catch {}
-  }
-}
+
     // Preflight
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers });
     }
 
-    // ---------- Normalize path by LAST SEGMENT only ----------
-    const segments = url.pathname.split("/").filter(Boolean); // e.g. ["sb","expiring-contracts"] or ["prod","sb","expiring-contracts"]
-    const last = segments[segments.length - 1] || "";         // "expiring-contracts" / "agency-share" / "health"
+    // ---------- Normalize path by segments ----------
+    // Works for:
+    //   /sb/expiring-contracts
+    //   /prod/sb/expiring-contracts
+    //   /sb/contracts/insights
+    //   /sb/agencies
+    const segments = url.pathname.split("/").filter(Boolean);
+    const last = segments[segments.length - 1] || "";
+    const secondLast = segments.length > 1 ? segments[segments.length - 2] : "";
 
     // ---------- Health ----------
+    // e.g. GET /sb/health
     if (last === "health") {
       return new Response(JSON.stringify({ ok: true, db: true }), {
         status: 200,
         headers: { ...headers, "Content-Type": "application/json" },
       });
+    }
+
+    /* =============================================================
+     * 0) Agencies list (for dropdown / datalist)
+     *    GET /sb/agencies
+     *    Returns top-level + sub-agencies + offices
+     * =========================================================== */
+    if (last === "agencies") {
+      const client = makeClient(env);
+      try {
+        await client.connect();
+        const sql = `
+          SELECT DISTINCT name
+          FROM (
+            SELECT awarding_agency_name        AS name
+            FROM public.usaspending_awards_v1
+            WHERE awarding_agency_name IS NOT NULL
+
+            UNION
+
+            SELECT awarding_sub_agency_name   AS name
+            FROM public.usaspending_awards_v1
+            WHERE awarding_sub_agency_name IS NOT NULL
+
+            UNION
+
+            SELECT awarding_office_name       AS name
+            FROM public.usaspending_awards_v1
+            WHERE awarding_office_name IS NOT NULL
+          ) AS x
+          WHERE name IS NOT NULL
+          ORDER BY name
+          LIMIT 400;
+        `;
+        const { rows } = await client.query(sql);
+
+        return new Response(
+          JSON.stringify({ ok: true, rows }), // rows: [{ name: "Department of Defense" }, { name: "USSOCOM" }, ...]
+          { status: 200, headers: { ...headers, "Content-Type": "application/json" } }
+        );
+      } catch (e) {
+        try { await client.end(); } catch {}
+        return new Response(
+          JSON.stringify({ ok: false, error: e?.message || "query failed" }),
+          { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
+        );
+      } finally {
+        try { await client.end(); } catch {}
+      }
     }
 
     /* =============================================================
@@ -237,6 +267,7 @@ export default {
           agency: r.agency,
           naics: r.naics,
           end_date: r.end_date,
+          // potential_total_value_of_award_num already chosen in COL.VALUE
           value: typeof r.value === "number" ? r.value : Number(r.value),
         }));
 
@@ -257,23 +288,35 @@ export default {
         );
       }
     }
+
     /* =============================================================
      * 3) Contract insights (AI)
      *    POST /sb/contracts/insights  { piid: "HC102825F0042" }
+     *    segments: ["sb","contracts","insights"]
      * =========================================================== */
-    if (path === "/contracts/insights" && request.method === "POST") {
-      const client = makeClient(env)
+    if (secondLast === "contracts" && last === "insights" && request.method === "POST") {
+      if (!env.OPENAI_API_KEY) {
+        return new Response(
+          JSON.stringify({
+            ok: false,
+            error: "OPENAI_API_KEY is not configured for sb-analytics.",
+          }),
+          { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
+        );
+      }
+
+      const client = makeClient(env);
       try {
-        const body = await request.json().catch(() => ({}))
-        const piid = String(body.piid || "").trim().toUpperCase()
+        const body = await request.json().catch(() => ({}));
+        const piid = String(body.piid || "").trim().toUpperCase();
         if (!piid) {
           return new Response(
             JSON.stringify({ ok: false, error: "Missing piid" }),
             { status: 400, headers: { ...headers, "Content-Type": "application/json" } }
-          )
+          );
         }
 
-        await client.connect()
+        await client.connect();
 
         // Pull a small bundle of context for the model
         const sql = `
@@ -296,18 +339,17 @@ export default {
           ORDER BY pop_current_end_date DESC
           LIMIT 1
         `;
-        const { rows } = await client.query(sql, [piid])
+        const { rows } = await client.query(sql, [piid]);
 
         if (!rows.length) {
           return new Response(
             JSON.stringify({ ok: false, error: "No award found for that PIID." }),
             { status: 404, headers: { ...headers, "Content-Type": "application/json" } }
-          )
+          );
         }
 
-        const a = rows[0]
+        const a = rows[0];
 
-        // Build a compact prompt – you can tune this over time.
         const prompt = `
 You are helping a small federal contractor quickly understand a single contract.
 
@@ -328,9 +370,8 @@ In 3–5 bullet points, explain:
 3) What a small business should consider if they want to compete on the recompete or as a teaming partner.
 
 Keep it under 180 words, concise, and non-technical.
-        `.trim()
+        `.trim();
 
-        // Call OpenAI (set OPENAI_API_KEY in sb-analytics env)
         const aiRes = await fetch("https://api.openai.com/v1/chat/completions", {
           method: "POST",
           headers: {
@@ -345,33 +386,34 @@ Keep it under 180 words, concise, and non-technical.
             ],
             max_tokens: 350,
           }),
-        })
+        });
 
-        const aiText = await aiRes.text()
-        let aiJson: any = {}
+        const aiText = await aiRes.text();
+        let aiJson = {};
         try {
-          aiJson = aiText ? JSON.parse(aiText) : {}
+          aiJson = aiText ? JSON.parse(aiText) : {};
         } catch {
-          throw new Error("AI response was not valid JSON: " + aiText.slice(0, 120))
+          throw new Error("AI response was not valid JSON: " + aiText.slice(0, 120));
         }
 
         const summary =
           aiJson.choices?.[0]?.message?.content?.trim() ||
-          "AI produced no summary."
+          "AI produced no summary.";
 
         return new Response(
           JSON.stringify({ ok: true, summary }),
           { status: 200, headers: { ...headers, "Content-Type": "application/json" } }
-        )
-      } catch (e: any) {
+        );
+      } catch (e) {
         return new Response(
           JSON.stringify({ ok: false, error: e?.message || "AI insight failed" }),
           { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
-        )
+        );
       } finally {
-        try { await client.end() } catch {}
+        try { await client.end(); } catch {}
       }
     }
+
     // ---------- Fallback ----------
     return new Response("Not found", { status: 404, headers });
   },
