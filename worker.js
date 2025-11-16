@@ -76,7 +76,12 @@ export default {
       return new Response(null, { status: 204, headers });
     }
 
-    // Normalize path segments for routing
+    // ---------- Normalize path by segments ----------
+    // Works for:
+    //   /sb/expiring-contracts
+    //   /prod/sb/expiring-contracts
+    //   /sb/contracts/insights
+    //   /sb/agencies
     const segments = url.pathname.split("/").filter(Boolean);
     const last = segments[segments.length - 1] || "";
     const secondLast = segments.length > 1 ? segments[segments.length - 2] : "";
@@ -102,19 +107,19 @@ export default {
         const sql = `
           SELECT DISTINCT name
           FROM (
-            SELECT awarding_agency_name      AS name
+            SELECT awarding_agency_name        AS name
             FROM public.usaspending_awards_v1
             WHERE awarding_agency_name IS NOT NULL
 
             UNION
 
-            SELECT awarding_sub_agency_name AS name
+            SELECT awarding_sub_agency_name   AS name
             FROM public.usaspending_awards_v1
             WHERE awarding_sub_agency_name IS NOT NULL
 
             UNION
 
-            SELECT awarding_office_name     AS name
+            SELECT awarding_office_name       AS name
             FROM public.usaspending_awards_v1
             WHERE awarding_office_name IS NOT NULL
           ) AS x
@@ -125,14 +130,20 @@ export default {
         const { rows } = await client.query(sql);
 
         return new Response(
-          JSON.stringify({ ok: true, rows }), // rows: [{ name: "Department of Defense" }, { name: "U.S. Special Operations Command" }, ...]
-          { status: 200, headers: { ...headers, "Content-Type": "application/json" } }
+          JSON.stringify({ ok: true, rows }),
+          {
+            status: 200,
+            headers: { ...headers, "Content-Type": "application/json" },
+          }
         );
       } catch (e) {
         try { await client.end(); } catch {}
         return new Response(
           JSON.stringify({ ok: false, error: e?.message || "query failed" }),
-          { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
+          {
+            status: 500,
+            headers: { ...headers, "Content-Type": "application/json" },
+          }
         );
       } finally {
         try { await client.end(); } catch {}
@@ -225,8 +236,6 @@ export default {
       try {
         await client.connect();
 
-        // NOTE: we match on awarding_agency_name OR awarding_sub_agency_name,
-        // but we do it as a *prefix* match to stay index-friendly.
         const sql = `
           SELECT
             ${COL.PIID}     AS piid,
@@ -241,8 +250,8 @@ export default {
             AND ${COL.END_DATE} < CURRENT_DATE + $1::int
             AND (
               $2::text IS NULL
-              OR ${COL.AGENCY}    ILIKE $2 || '%'
-              OR ${COL.SUB_AGENCY} ILIKE $2 || '%'
+              OR ${COL.AGENCY}    ILIKE '%' || $2 || '%'
+              OR ${COL.SUB_AGENCY} ILIKE '%' || $2 || '%'
             )
             AND (
               $3::text[] IS NULL
@@ -294,7 +303,7 @@ export default {
      * 3) Contract insights (AI)
      *    POST /sb/contracts/insights  { piid: "HC102825F0042" }
      *    Matches any path that ends with "/contracts/insights"
-     *    Uses fp_contract_incumbent_subs view for subaward footprint.
+     *    Now also pulls subaward footprint from fp_contract_incumbent_subs_agg
      * =========================================================== */
     if (
       request.method === "POST" &&
@@ -306,7 +315,10 @@ export default {
             ok: false,
             error: "OPENAI_API_KEY is not configured for sb-analytics.",
           }),
-          { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
+          {
+            status: 500,
+            headers: { ...headers, "Content-Type": "application/json" },
+          }
         );
       }
 
@@ -317,13 +329,16 @@ export default {
         if (!piid) {
           return new Response(
             JSON.stringify({ ok: false, error: "Missing piid" }),
-            { status: 400, headers: { ...headers, "Content-Type": "application/json" } }
+            {
+              status: 400,
+              headers: { ...headers, "Content-Type": "application/json" },
+            }
           );
         }
 
         await client.connect();
 
-        // Pull award snapshot + aggregated subaward footprint
+        // Pull a small bundle of context for the model, plus aggregated subaward data
         const sql = `
           SELECT
             a.award_id_piid,
@@ -342,9 +357,9 @@ export default {
             s.subaward_count,
             s.distinct_sub_recipients,
             s.total_subaward_amount,
-            s.subawardees_sample
+            s.sample_sub_names
           FROM public.usaspending_awards_v1 AS a
-          LEFT JOIN public.fp_contract_incumbent_subs AS s
+          LEFT JOIN public.fp_contract_incumbent_subs_agg AS s
             ON s.prime_piid = a.award_id_piid
           WHERE a.award_id_piid = $1
           ORDER BY a.pop_current_end_date DESC
@@ -354,17 +369,38 @@ export default {
 
         if (!rows.length) {
           return new Response(
-            JSON.stringify({ ok: false, error: "No award found for that PIID." }),
-            { status: 404, headers: { ...headers, "Content-Type": "application/json" } }
+            JSON.stringify({
+              ok: false,
+              error: "No award found for that PIID.",
+            }),
+            {
+              status: 404,
+              headers: { ...headers, "Content-Type": "application/json" },
+            }
           );
         }
 
         const a = rows[0];
 
-        const subCount = a.subaward_count ?? 0;
-        const subDistinct = a.distinct_sub_recipients ?? 0;
-        const subTotal = a.total_subaward_amount ?? 0;
-        const subSample = a.subawardees_sample || null;
+        const subCount = a.subaward_count || 0;
+        const distinctSubs = a.distinct_sub_recipients || 0;
+        const totalSubAmt = a.total_subaward_amount || 0;
+        const sampleSubs = Array.isArray(a.sample_sub_names)
+          ? a.sample_sub_names.filter(Boolean)
+          : [];
+
+        const subSummary =
+          subCount > 0
+            ? `
+Subaward footprint:
+- Subaward count: ${subCount}
+- Distinct subrecipients (UEI): ${distinctSubs}
+- Total known subaward amount: ${totalSubAmt}
+- Sample subcontractors: ${
+                sampleSubs.length ? sampleSubs.join("; ") : "not listed"
+              }
+`.trim()
+            : "No subaward records were found for this prime award in the subaward view.";
 
         const prompt = `
 You are helping a small federal contractor quickly understand a single contract.
@@ -372,27 +408,29 @@ You are helping a small federal contractor quickly understand a single contract.
 Contract snapshot:
 - PIID: ${a.award_id_piid}
 - Awarding agency: ${a.awarding_agency_name || "—"}
-- Sub-agency / office: ${a.awarding_sub_agency_name || "—"} / ${a.awarding_office_name || "—"}
-- Recipient (prime): ${a.recipient_name || "—"}
+- Sub-agency / office: ${a.awarding_sub_agency_name || "—"} / ${
+          a.awarding_office_name || "—"
+        }
+- Prime recipient: ${a.recipient_name || "—"}
 - NAICS: ${a.naics_code || "—"} – ${a.naics_description || "—"}
-- Period of performance: ${a.pop_start_date || "—"} to ${a.pop_current_end_date || "—"} (potential: ${a.pop_potential_end_date || "—"})
+- Period of performance: ${a.pop_start_date || "—"} to ${
+          a.pop_current_end_date || "—"
+        } (potential: ${a.pop_potential_end_date || "—"})
 - Total obligated: ${a.total_dollars_obligated_num || 0}
-- Current value (base + exercised): ${a.current_total_value_of_award_num || 0}
+- Current value (base + exercised): ${
+          a.current_total_value_of_award_num || 0
+        }
 - Ceiling (base + all options): ${a.potential_total_value_of_award_num || 0}
 
-Subaward footprint (from FP subaward DB):
-- Reported subawards: ${subCount}
-- Distinct subrecipients: ${subDistinct}
-- Total dollars to subs: ${subTotal || 0}
-- Sample subrecipients: ${subSample || "not reported"}
+${subSummary}
 
-In 4–6 bullet points, explain:
+In 3–6 bullet points, explain:
 1) Where this contract is in its lifecycle (early / mid / near end).
 2) How heavily used it appears based on obligation vs ceiling.
-3) What the subaward footprint suggests about teaming or subcontracting opportunities.
-4) What a small business should consider if they want to compete on the recompete or as a teaming partner.
+3) What the subcontracting picture looks like (is there a meaningful subaward footprint, and what does that imply?).
+4) What a small business should consider if they want to compete on the recompete or as a teaming partner or subcontractor.
 
-Keep it under 200 words, concise, and non-technical.
+Keep it under 220 words, concise, and non-technical.
         `.trim();
 
         const aiRes = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -404,10 +442,14 @@ Keep it under 200 words, concise, and non-technical.
           body: JSON.stringify({
             model: "gpt-4.1-mini",
             messages: [
-              { role: "system", content: "You are a federal contracts analyst helping small businesses." },
+              {
+                role: "system",
+                content:
+                  "You are a federal contracts analyst helping small businesses understand opportunities and incumbents.",
+              },
               { role: "user", content: prompt },
             ],
-            max_tokens: 350,
+            max_tokens: 400,
           }),
         });
 
@@ -416,24 +458,31 @@ Keep it under 200 words, concise, and non-technical.
         try {
           aiJson = aiText ? JSON.parse(aiText) : {};
         } catch {
-          throw new Error("AI response was not valid JSON: " + aiText.slice(0, 120));
+          throw new Error(
+            "AI response was not valid JSON: " + aiText.slice(0, 120)
+          );
         }
 
         const summary =
           aiJson.choices?.[0]?.message?.content?.trim() ||
           "AI produced no summary.";
 
-        return new Response(
-          JSON.stringify({ ok: true, summary }),
-          { status: 200, headers: { ...headers, "Content-Type": "application/json" } }
-        );
+        return new Response(JSON.stringify({ ok: true, summary }), {
+          status: 200,
+          headers: { ...headers, "Content-Type": "application/json" },
+        });
       } catch (e) {
         return new Response(
           JSON.stringify({ ok: false, error: e?.message || "AI insight failed" }),
-          { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
+          {
+            status: 500,
+            headers: { ...headers, "Content-Type": "application/json" },
+          }
         );
       } finally {
-        try { await client.end(); } catch {}
+        try {
+          await client.end();
+        } catch {}
       }
     }
 
