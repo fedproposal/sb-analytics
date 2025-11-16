@@ -67,7 +67,33 @@ export default {
     const url = new URL(request.url);
     const origin = request.headers.get("Origin") || "";
     const headers = cors(origin, env);
-
+// Add Agencies to List to choose from
+    if (path === "/agencies") {
+  const client = makeClient(env)
+  try {
+    await client.connect()
+    const sql = `
+      SELECT DISTINCT awarding_agency_name AS agency
+      FROM public.usaspending_awards_v1
+      WHERE awarding_agency_name IS NOT NULL
+      ORDER BY awarding_agency_name
+      LIMIT 200
+    `;
+    const { rows } = await client.query(sql)
+    return new Response(
+      JSON.stringify({ ok: true, rows }),
+      { status: 200, headers: { ...headers, "Content-Type": "application/json" } }
+    )
+  } catch (e: any) {
+    try { await client.end() } catch {}
+    return new Response(
+      JSON.stringify({ ok: false, error: e?.message || "query failed" }),
+      { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
+    )
+  } finally {
+    try { await client.end() } catch {}
+  }
+}
     // Preflight
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers });
