@@ -71,18 +71,25 @@ export default {
     const origin = request.headers.get("Origin") || "";
     const headers = cors(origin, env);
 
-    // Normalize path segments once for all route checks
-    const segments = url.pathname.split("/").filter(Boolean); // e.g. ["sb","expiring-contracts"]
-    const last = segments[segments.length - 1] || "";
-    const secondLast = segments.length > 1 ? segments[segments.length - 2] : "";
-
-    // Preflight
+    // ---------- Preflight ----------
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers });
     }
 
-    // ---------- Health ----------
-    // e.g. GET /sb/health
+    // ---------- Normalize path segments once ----------
+    // Works for:
+    //   /sb/expiring-contracts
+    //   /prod/sb/expiring-contracts
+    //   /sb/contracts/insights
+    //   /sb/agencies
+    const segments = url.pathname.split("/").filter(Boolean);
+    const last = segments[segments.length - 1] || "";
+    const secondLast = segments.length > 1 ? segments[segments.length - 2] : "";
+
+    /* =============================================================
+     * Health
+     *   GET /sb/health
+     * =========================================================== */
     if (last === "health") {
       return new Response(JSON.stringify({ ok: true, db: true }), {
         status: 200,
@@ -93,7 +100,7 @@ export default {
     /* =============================================================
      * 0) Agencies list (for dropdown / datalist)
      *    GET /sb/agencies
-     *    Returns a combined list of agencies / sub-agencies / offices
+     *    Returns top-level + sub-agencies + offices (deduped)
      * =========================================================== */
     if (last === "agencies") {
       const client = makeClient(env);
@@ -102,19 +109,19 @@ export default {
         const sql = `
           SELECT DISTINCT name
           FROM (
-            SELECT awarding_agency_name      AS name
+            SELECT awarding_agency_name        AS name
             FROM public.usaspending_awards_v1
             WHERE awarding_agency_name IS NOT NULL
 
             UNION
 
-            SELECT awarding_sub_agency_name AS name
+            SELECT awarding_sub_agency_name   AS name
             FROM public.usaspending_awards_v1
             WHERE awarding_sub_agency_name IS NOT NULL
 
             UNION
 
-            SELECT awarding_office_name     AS name
+            SELECT awarding_office_name       AS name
             FROM public.usaspending_awards_v1
             WHERE awarding_office_name IS NOT NULL
           ) AS x
@@ -125,24 +132,27 @@ export default {
         const { rows } = await client.query(sql);
 
         return new Response(
-          JSON.stringify({ ok: true, rows }),
+          JSON.stringify({ ok: true, rows }), // [{ name: "Department of Defense" }, { name: "U.S. Special Operations Command" }, ...]
           { status: 200, headers: { ...headers, "Content-Type": "application/json" } }
         );
       } catch (e) {
-        try { await client.end(); } catch {}
+        try {
+          await client.end();
+        } catch {}
         return new Response(
           JSON.stringify({ ok: false, error: e?.message || "query failed" }),
           { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
         );
       } finally {
-        try { await client.end(); } catch {}
+        try {
+          await client.end();
+        } catch {}
       }
     }
 
     /* =============================================================
      * 1) SB Agency Share (existing)
      *    GET /sb/agency-share?fy=2026&limit=12
-     *    (or any route whose last segment is `agency-share`)
      * =========================================================== */
     if (last === "agency-share") {
       const fy = parseInt(url.searchParams.get("fy") || "2026", 10);
@@ -197,11 +207,7 @@ export default {
 
     /* =============================================================
      * 2) Expiring Contracts (Neon-backed)
-     *    GET /sb/expiring-contracts?naics=541519&agency=...&window_days=180&limit=50
-     *    (or any route whose last segment is `expiring-contracts`)
-     *
-     *    NOTE: agency filter now uses exact match on agency / sub-agency
-     *          so it can use indexes and not time out.
+     *    GET /sb/expiring-contracts?naics=541519&agency=USSOCOM&window_days=180&limit=50
      * =========================================================== */
     if (last === "expiring-contracts") {
       const naicsParam = (url.searchParams.get("naics") || "").trim();
@@ -242,8 +248,8 @@ export default {
             AND ${COL.END_DATE} < CURRENT_DATE + $1::int
             AND (
               $2::text IS NULL
-              OR ${COL.AGENCY}    = $2
-              OR ${COL.SUB_AGENCY} = $2
+              OR ${COL.AGENCY}     ILIKE '%' || $2 || '%'
+              OR ${COL.SUB_AGENCY} ILIKE '%' || $2 || '%'
             )
             AND (
               $3::text[] IS NULL
@@ -254,10 +260,10 @@ export default {
         `;
 
         const params = [
-          windowDays,                        // $1
-          agencyFilter || null,              // $2
+          windowDays,                       // $1
+          agencyFilter || null,             // $2
           naicsList.length ? naicsList : null, // $3
-          limit,                             // $4
+          limit,                            // $4
         ];
 
         const { rows } = await client.query(sql, params);
@@ -295,8 +301,6 @@ export default {
      * 3) Contract insights (AI)
      *    POST /sb/contracts/insights  { piid: "HC102825F0042" }
      *    Matches any path that ends with "/contracts/insights"
-     *
-     *    Now also pulls subaward/incumbent info from fp_contract_incumbent_subs.
      * =========================================================== */
     if (
       request.method === "POST" &&
@@ -325,7 +329,7 @@ export default {
 
         await client.connect();
 
-        // 1) Prime award snapshot
+        // 3a) Main award snapshot
         const awardSql = `
           SELECT
             award_key,
@@ -358,65 +362,67 @@ export default {
 
         const a = awardRows[0];
 
-        // 2) Subaward / incumbent summary (if any) from fp_contract_incumbent_subs
-        //    We aggregate here so it works even if the view is detailed.
+        // 3b) Subaward / incumbent summary from fp_contract_incumbent_subs
+        // (view you created earlier)
         const subsSql = `
           SELECT
-            COUNT(*)                                    AS subaward_count,
-            COUNT(DISTINCT sub_uei)                     AS distinct_sub_recipients,
-            SUM(subaward_amount)                        AS total_subaward_amount,
-            ARRAY_AGG(
-              DISTINCT sub_name
-              ORDER BY subaward_amount DESC NULLS LAST
-            )[1:3]                                      AS sample_sub_names
+            COUNT(*)                                  AS subaward_count,
+            COUNT(DISTINCT sub_uei)                  AS distinct_sub_recipients,
+            SUM(subaward_amount)                     AS total_subaward_amount,
+            ARRAY_AGG(DISTINCT sub_name
+                      ORDER BY subaward_amount DESC NULLS LAST)[1:5]
+                                                    AS sample_sub_names
           FROM fp_contract_incumbent_subs
           WHERE prime_piid = $1
         `;
         const { rows: subRows } = await client.query(subsSql, [piid]);
-        const subs = subRows[0] || {};
-        const subawardCount = Number(subs.subaward_count || 0);
-        const distinctSubs = Number(subs.distinct_sub_recipients || 0);
-        const totalSubAmt = Number(subs.total_subaward_amount || 0);
-        const sampleSubNames = Array.isArray(subs.sample_sub_names)
-          ? subs.sample_sub_names.filter(Boolean)
+        const s = subRows[0] || {};
+
+        const subawardCount =
+          typeof s.subaward_count === "number" ? s.subaward_count : 0;
+        const distinctSubRecipients =
+          typeof s.distinct_sub_recipients === "number"
+            ? s.distinct_sub_recipients
+            : 0;
+        const totalSubAmount =
+          typeof s.total_subaward_amount === "number"
+            ? s.total_subaward_amount
+            : 0;
+        const sampleSubs = Array.isArray(s.sample_sub_names)
+          ? s.sample_sub_names.filter(Boolean)
           : [];
 
-        const subsLine =
-          subawardCount > 0
-            ? `There are about ${subawardCount} reported subawards (to ~${distinctSubs} vendors) totaling approximately $${totalSubAmt.toLocaleString(
-                "en-US",
-                { maximumFractionDigits: 0 }
-              )}. Notable subs: ${sampleSubNames.join(", ") || "names not disclosed"}.`
-            : `No contract subawards are visible in the public USAspending subaward data for this PIID.`;
-
-        // 3) Build prompt for the model
         const prompt = `
-You are helping a small federal contractor quickly understand a single contract and its incumbent footprint.
+You are helping a small federal contractor quickly understand a single contract.
 
-Prime contract snapshot:
+Contract snapshot:
 - PIID: ${a.award_id_piid}
 - Awarding agency: ${a.awarding_agency_name || "—"}
 - Sub-agency / office: ${a.awarding_sub_agency_name || "—"} / ${a.awarding_office_name || "—"}
-- Prime contractor (incumbent): ${a.recipient_name || "—"}
+- Recipient (prime): ${a.recipient_name || "—"}
 - NAICS: ${a.naics_code || "—"} – ${a.naics_description || "—"}
 - Period of performance: ${a.pop_start_date || "—"} to ${a.pop_current_end_date || "—"} (potential: ${a.pop_potential_end_date || "—"})
 - Total obligated: ${a.total_dollars_obligated_num || 0}
 - Current value (base + exercised): ${a.current_total_value_of_award_num || 0}
 - Ceiling (base + all options): ${a.potential_total_value_of_award_num || 0}
 
-Subaward / teaming snapshot:
-- ${subsLine}
+Subaward / subcontracting snapshot:
+- Number of subawards on record: ${subawardCount}
+- Distinct subrecipients: ${distinctSubRecipients}
+- Total subaward dollars (approx): ${totalSubAmount || 0}
+- Sample subrecipients (if any): ${
+          sampleSubs.length ? sampleSubs.join(", ") : "none listed"
+        }
 
-In 4–6 bullet points, explain:
+In 3–6 bullet points, explain:
 1) Where this contract is in its lifecycle (early / mid / near end).
-2) How heavily used it appears based on obligation vs ceiling.
-3) What the subaward footprint suggests about teaming patterns (e.g., one key sub vs many small subs).
-4) Concrete ideas for how a small business could compete on the recompete or position as a teaming partner.
+2) How heavily used it appears based on obligations vs the ceiling.
+3) What the subaward pattern suggests about teaming and incumbent relationships.
+4) What a small business should consider to compete on the recompete, or position as a teaming / subcontracting partner.
 
 Keep it under 220 words, concise, and non-technical.
         `.trim();
 
-        // 4) Call OpenAI
         const aiRes = await fetch("https://api.openai.com/v1/chat/completions", {
           method: "POST",
           headers: {
@@ -429,11 +435,11 @@ Keep it under 220 words, concise, and non-technical.
               {
                 role: "system",
                 content:
-                  "You are a federal contracts analyst helping small businesses interpret USAspending data. Be practical, specific, and jargon-light.",
+                  "You are a federal contracts analyst helping small businesses interpret USAspending-style data.",
               },
               { role: "user", content: prompt },
             ],
-            max_tokens: 450,
+            max_tokens: 400,
           }),
         });
 
@@ -443,7 +449,7 @@ Keep it under 220 words, concise, and non-technical.
           aiJson = aiText ? JSON.parse(aiText) : {};
         } catch {
           throw new Error(
-            "AI response was not valid JSON: " + aiText.slice(0, 120)
+            "AI response was not valid JSON: " + aiText.slice(0, 160)
           );
         }
 
@@ -451,17 +457,19 @@ Keep it under 220 words, concise, and non-technical.
           aiJson.choices?.[0]?.message?.content?.trim() ||
           "AI produced no summary.";
 
-        return new Response(
-          JSON.stringify({ ok: true, summary }),
-          { status: 200, headers: { ...headers, "Content-Type": "application/json" } }
-        );
+        return new Response(JSON.stringify({ ok: true, summary }), {
+          status: 200,
+          headers: { ...headers, "Content-Type": "application/json" },
+        });
       } catch (e) {
         return new Response(
           JSON.stringify({ ok: false, error: e?.message || "AI insight failed" }),
           { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
         );
       } finally {
-        try { await client.end(); } catch {}
+        try {
+          await client.end();
+        } catch {}
       }
     }
 
