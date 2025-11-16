@@ -58,7 +58,7 @@ const COL = {
   AWARD_ID: "award_key",
 
   // Current total value of award (NUMERIC)
-  VALUE: "current_total_value_of_award_num",
+  VALUE: "potential_total_value_of_award_num",
 };
 /* ================================================================= */
 
