@@ -257,7 +257,121 @@ export default {
         );
       }
     }
+    /* =============================================================
+     * 3) Contract insights (AI)
+     *    POST /sb/contracts/insights  { piid: "HC102825F0042" }
+     * =========================================================== */
+    if (path === "/contracts/insights" && request.method === "POST") {
+      const client = makeClient(env)
+      try {
+        const body = await request.json().catch(() => ({}))
+        const piid = String(body.piid || "").trim().toUpperCase()
+        if (!piid) {
+          return new Response(
+            JSON.stringify({ ok: false, error: "Missing piid" }),
+            { status: 400, headers: { ...headers, "Content-Type": "application/json" } }
+          )
+        }
 
+        await client.connect()
+
+        // Pull a small bundle of context for the model
+        const sql = `
+          SELECT
+            award_id_piid,
+            awarding_agency_name,
+            awarding_sub_agency_name,
+            awarding_office_name,
+            recipient_name,
+            naics_code,
+            naics_description,
+            pop_start_date,
+            pop_current_end_date,
+            pop_potential_end_date,
+            current_total_value_of_award_num,
+            potential_total_value_of_award_num,
+            total_dollars_obligated_num
+          FROM public.usaspending_awards_v1
+          WHERE award_id_piid = $1
+          ORDER BY pop_current_end_date DESC
+          LIMIT 1
+        `;
+        const { rows } = await client.query(sql, [piid])
+
+        if (!rows.length) {
+          return new Response(
+            JSON.stringify({ ok: false, error: "No award found for that PIID." }),
+            { status: 404, headers: { ...headers, "Content-Type": "application/json" } }
+          )
+        }
+
+        const a = rows[0]
+
+        // Build a compact prompt – you can tune this over time.
+        const prompt = `
+You are helping a small federal contractor quickly understand a single contract.
+
+Contract snapshot:
+- PIID: ${a.award_id_piid}
+- Awarding agency: ${a.awarding_agency_name || "—"}
+- Sub-agency / office: ${a.awarding_sub_agency_name || "—"} / ${a.awarding_office_name || "—"}
+- Recipient: ${a.recipient_name || "—"}
+- NAICS: ${a.naics_code || "—"} – ${a.naics_description || "—"}
+- Period of performance: ${a.pop_start_date || "—"} to ${a.pop_current_end_date || "—"} (potential: ${a.pop_potential_end_date || "—"})
+- Total obligated: ${a.total_dollars_obligated_num || 0}
+- Current value (base + exercised): ${a.current_total_value_of_award_num || 0}
+- Ceiling (base + all options): ${a.potential_total_value_of_award_num || 0}
+
+In 3–5 bullet points, explain:
+1) Where this contract is in its lifecycle (early / mid / near end).
+2) How heavily used it appears based on obligation vs ceiling.
+3) What a small business should consider if they want to compete on the recompete or as a teaming partner.
+
+Keep it under 180 words, concise, and non-technical.
+        `.trim()
+
+        // Call OpenAI (set OPENAI_API_KEY in sb-analytics env)
+        const aiRes = await fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+          },
+          body: JSON.stringify({
+            model: "gpt-4.1-mini",
+            messages: [
+              { role: "system", content: "You are a federal contracts analyst helping small businesses." },
+              { role: "user", content: prompt },
+            ],
+            max_tokens: 350,
+          }),
+        })
+
+        const aiText = await aiRes.text()
+        let aiJson: any = {}
+        try {
+          aiJson = aiText ? JSON.parse(aiText) : {}
+        } catch {
+          throw new Error("AI response was not valid JSON: " + aiText.slice(0, 120))
+        }
+
+        const summary =
+          aiJson.choices?.[0]?.message?.content?.trim() ||
+          "AI produced no summary."
+
+        return new Response(
+          JSON.stringify({ ok: true, summary }),
+          { status: 200, headers: { ...headers, "Content-Type": "application/json" } }
+        )
+      } catch (e: any) {
+        return new Response(
+          JSON.stringify({ ok: false, error: e?.message || "AI insight failed" }),
+          { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
+        )
+      } finally {
+        try { await client.end() } catch {}
+      }
+    }
     // ---------- Fallback ----------
     return new Response("Not found", { status: 404, headers });
   },
