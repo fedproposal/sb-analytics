@@ -68,6 +68,12 @@ export default {
     const origin = request.headers.get("Origin") || "";
     const headers = cors(origin, env);
 
+    // Normalize path segments once for all route checks
+    const segments = url.pathname.split("/").filter(Boolean);
+    // e.g. "/sb/expiring-contracts" -> ["sb","expiring-contracts"]
+    const last = segments[segments.length - 1] || "";
+    const secondLast = segments.length > 1 ? segments[segments.length - 2] : "";
+
     // Preflight
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers });
@@ -290,67 +296,69 @@ export default {
     }
 
     /* =============================================================
-     * 3) Contract insights (AI)
-     *    POST /sb/contracts/insights  { piid: "HC102825F0042" }
-     *    segments: ["sb","contracts","insights"]
-     * =========================================================== */
-    if (secondLast === "contracts" && last === "insights" && request.method === "POST") {
-      if (!env.OPENAI_API_KEY) {
-        return new Response(
-          JSON.stringify({
-            ok: false,
-            error: "OPENAI_API_KEY is not configured for sb-analytics.",
-          }),
-          { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
-        );
-      }
+ * 3) Contract insights (AI)
+ *    POST /sb/contracts/insights  { piid: "HC102825F0042" }
+ *    Matches any path that ends with "/contracts/insights"
+ * =========================================================== */
+if (
+  request.method === "POST" &&
+  url.pathname.toLowerCase().endsWith("/contracts/insights")
+) {
+  if (!env.OPENAI_API_KEY) {
+    return new Response(
+      JSON.stringify({
+        ok: false,
+        error: "OPENAI_API_KEY is not configured for sb-analytics.",
+      }),
+      { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
+    );
+  }
 
-      const client = makeClient(env);
-      try {
-        const body = await request.json().catch(() => ({}));
-        const piid = String(body.piid || "").trim().toUpperCase();
-        if (!piid) {
-          return new Response(
-            JSON.stringify({ ok: false, error: "Missing piid" }),
-            { status: 400, headers: { ...headers, "Content-Type": "application/json" } }
-          );
-        }
+  const client = makeClient(env);
+  try {
+    const body = await request.json().catch(() => ({}));
+    const piid = String(body.piid || "").trim().toUpperCase();
+    if (!piid) {
+      return new Response(
+        JSON.stringify({ ok: false, error: "Missing piid" }),
+        { status: 400, headers: { ...headers, "Content-Type": "application/json" } }
+      );
+    }
 
-        await client.connect();
+    await client.connect();
 
-        // Pull a small bundle of context for the model
-        const sql = `
-          SELECT
-            award_id_piid,
-            awarding_agency_name,
-            awarding_sub_agency_name,
-            awarding_office_name,
-            recipient_name,
-            naics_code,
-            naics_description,
-            pop_start_date,
-            pop_current_end_date,
-            pop_potential_end_date,
-            current_total_value_of_award_num,
-            potential_total_value_of_award_num,
-            total_dollars_obligated_num
-          FROM public.usaspending_awards_v1
-          WHERE award_id_piid = $1
-          ORDER BY pop_current_end_date DESC
-          LIMIT 1
-        `;
-        const { rows } = await client.query(sql, [piid]);
+    const sql = `
+      SELECT
+        award_id_piid,
+        awarding_agency_name,
+        awarding_sub_agency_name,
+        awarding_office_name,
+        recipient_name,
+        naics_code,
+        naics_description,
+        pop_start_date,
+        pop_current_end_date,
+        pop_potential_end_date,
+        current_total_value_of_award_num,
+        potential_total_value_of_award_num,
+        total_dollars_obligated_num
+      FROM public.usaspending_awards_v1
+      WHERE award_id_piid = $1
+      ORDER BY pop_current_end_date DESC
+      LIMIT 1
+    `;
+    const { rows } = await client.query(sql, [piid]);
 
-        if (!rows.length) {
-          return new Response(
-            JSON.stringify({ ok: false, error: "No award found for that PIID." }),
-            { status: 404, headers: { ...headers, "Content-Type": "application/json" } }
-          );
-        }
+    if (!rows.length) {
+      return new Response(
+        JSON.stringify({ ok: false, error: "No award found for that PIID." }),
+        { status: 404, headers: { ...headers, "Content-Type": "application/json" } }
+      );
+    }
 
-        const a = rows[0];
+    const a = rows[0];
 
-        const prompt = `
+    const prompt = `
 You are helping a small federal contractor quickly understand a single contract.
 
 Contract snapshot:
@@ -370,49 +378,49 @@ In 3–5 bullet points, explain:
 3) What a small business should consider if they want to compete on the recompete or as a teaming partner.
 
 Keep it under 180 words, concise, and non-technical.
-        `.trim();
+    `.trim();
 
-        const aiRes = await fetch("https://api.openai.com/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${env.OPENAI_API_KEY}`,
-          },
-          body: JSON.stringify({
-            model: "gpt-4.1-mini",
-            messages: [
-              { role: "system", content: "You are a federal contracts analyst helping small businesses." },
-              { role: "user", content: prompt },
-            ],
-            max_tokens: 350,
-          }),
-        });
+    const aiRes = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: "gpt-4.1-mini",
+        messages: [
+          { role: "system", content: "You are a federal contracts analyst helping small businesses." },
+          { role: "user", content: prompt },
+        ],
+        max_tokens: 350,
+      }),
+    });
 
-        const aiText = await aiRes.text();
-        let aiJson = {};
-        try {
-          aiJson = aiText ? JSON.parse(aiText) : {};
-        } catch {
-          throw new Error("AI response was not valid JSON: " + aiText.slice(0, 120));
-        }
-
-        const summary =
-          aiJson.choices?.[0]?.message?.content?.trim() ||
-          "AI produced no summary.";
-
-        return new Response(
-          JSON.stringify({ ok: true, summary }),
-          { status: 200, headers: { ...headers, "Content-Type": "application/json" } }
-        );
-      } catch (e) {
-        return new Response(
-          JSON.stringify({ ok: false, error: e?.message || "AI insight failed" }),
-          { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
-        );
-      } finally {
-        try { await client.end(); } catch {}
-      }
+    const aiText = await aiRes.text();
+    let aiJson = {};
+    try {
+      aiJson = aiText ? JSON.parse(aiText) : {};
+    } catch {
+      throw new Error("AI response was not valid JSON: " + aiText.slice(0, 120));
     }
+
+    const summary =
+      aiJson.choices?.[0]?.message?.content?.trim() ||
+      "AI produced no summary.";
+
+    return new Response(
+      JSON.stringify({ ok: true, summary }),
+      { status: 200, headers: { ...headers, "Content-Type": "application/json" } }
+    );
+  } catch (e) {
+    return new Response(
+      JSON.stringify({ ok: false, error: e?.message || "AI insight failed" }),
+      { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
+    );
+  } finally {
+    try { await client.end(); } catch {}
+  }
+}
 
     // ---------- Fallback ----------
     return new Response("Not found", { status: 404, headers });
