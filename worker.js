@@ -72,12 +72,7 @@ export default {
     const headers = cors(origin, env);
 
     // Normalize path segments once for all route checks
-    // Works for:
-    //   /sb/expiring-contracts
-    //   /prod/sb/expiring-contracts
-    //   /sb/contracts/insights
-    //   /sb/agencies
-    const segments = url.pathname.split("/").filter(Boolean);
+    const segments = url.pathname.split("/").filter(Boolean); // e.g. ["sb","expiring-contracts"]
     const last = segments[segments.length - 1] || "";
     const secondLast = segments.length > 1 ? segments[segments.length - 2] : "";
 
@@ -98,7 +93,7 @@ export default {
     /* =============================================================
      * 0) Agencies list (for dropdown / datalist)
      *    GET /sb/agencies
-     *    Returns top-level + sub-agencies + offices
+     *    Returns a combined list of agencies / sub-agencies / offices
      * =========================================================== */
     if (last === "agencies") {
       const client = makeClient(env);
@@ -107,19 +102,19 @@ export default {
         const sql = `
           SELECT DISTINCT name
           FROM (
-            SELECT awarding_agency_name        AS name
+            SELECT awarding_agency_name      AS name
             FROM public.usaspending_awards_v1
             WHERE awarding_agency_name IS NOT NULL
 
             UNION
 
-            SELECT awarding_sub_agency_name   AS name
+            SELECT awarding_sub_agency_name AS name
             FROM public.usaspending_awards_v1
             WHERE awarding_sub_agency_name IS NOT NULL
 
             UNION
 
-            SELECT awarding_office_name       AS name
+            SELECT awarding_office_name     AS name
             FROM public.usaspending_awards_v1
             WHERE awarding_office_name IS NOT NULL
           ) AS x
@@ -130,21 +125,17 @@ export default {
         const { rows } = await client.query(sql);
 
         return new Response(
-          JSON.stringify({ ok: true, rows }), // rows: [{ name: "Department of Defense" }, { name: "U.S. Special Operations Command" }, ...]
+          JSON.stringify({ ok: true, rows }),
           { status: 200, headers: { ...headers, "Content-Type": "application/json" } }
         );
       } catch (e) {
-        try {
-          await client.end();
-        } catch {}
+        try { await client.end(); } catch {}
         return new Response(
           JSON.stringify({ ok: false, error: e?.message || "query failed" }),
           { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
         );
       } finally {
-        try {
-          await client.end();
-        } catch {}
+        try { await client.end(); } catch {}
       }
     }
 
@@ -206,8 +197,11 @@ export default {
 
     /* =============================================================
      * 2) Expiring Contracts (Neon-backed)
-     *    GET /sb/expiring-contracts?naics=541519&agency=VA&window_days=180&limit=50
+     *    GET /sb/expiring-contracts?naics=541519&agency=...&window_days=180&limit=50
      *    (or any route whose last segment is `expiring-contracts`)
+     *
+     *    NOTE: agency filter now uses exact match on agency / sub-agency
+     *          so it can use indexes and not time out.
      * =========================================================== */
     if (last === "expiring-contracts") {
       const naicsParam = (url.searchParams.get("naics") || "").trim();
@@ -248,8 +242,8 @@ export default {
             AND ${COL.END_DATE} < CURRENT_DATE + $1::int
             AND (
               $2::text IS NULL
-              OR ${COL.AGENCY}     ILIKE '%' || $2 || '%'
-              OR ${COL.SUB_AGENCY} ILIKE '%' || $2 || '%'
+              OR ${COL.AGENCY}    = $2
+              OR ${COL.SUB_AGENCY} = $2
             )
             AND (
               $3::text[] IS NULL
@@ -301,6 +295,8 @@ export default {
      * 3) Contract insights (AI)
      *    POST /sb/contracts/insights  { piid: "HC102825F0042" }
      *    Matches any path that ends with "/contracts/insights"
+     *
+     *    Now also pulls subaward/incumbent info from fp_contract_incumbent_subs.
      * =========================================================== */
     if (
       request.method === "POST" &&
@@ -312,10 +308,7 @@ export default {
             ok: false,
             error: "OPENAI_API_KEY is not configured for sb-analytics.",
           }),
-          {
-            status: 500,
-            headers: { ...headers, "Content-Type": "application/json" },
-          }
+          { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
         );
       }
 
@@ -326,17 +319,16 @@ export default {
         if (!piid) {
           return new Response(
             JSON.stringify({ ok: false, error: "Missing piid" }),
-            {
-              status: 400,
-              headers: { ...headers, "Content-Type": "application/json" },
-            }
+            { status: 400, headers: { ...headers, "Content-Type": "application/json" } }
           );
         }
 
         await client.connect();
 
-        const sql = `
+        // 1) Prime award snapshot
+        const awardSql = `
           SELECT
+            award_key,
             award_id_piid,
             awarding_agency_name,
             awarding_sub_agency_name,
@@ -355,53 +347,76 @@ export default {
           ORDER BY pop_current_end_date DESC
           LIMIT 1
         `;
-        const { rows } = await client.query(sql, [piid]);
+        const { rows: awardRows } = await client.query(awardSql, [piid]);
 
-        if (!rows.length) {
+        if (!awardRows.length) {
           return new Response(
-            JSON.stringify({
-              ok: false,
-              error: "No award found for that PIID.",
-            }),
-            {
-              status: 404,
-              headers: { ...headers, "Content-Type": "application/json" },
-            }
+            JSON.stringify({ ok: false, error: "No award found for that PIID." }),
+            { status: 404, headers: { ...headers, "Content-Type": "application/json" } }
           );
         }
 
-        const a = rows[0];
+        const a = awardRows[0];
 
+        // 2) Subaward / incumbent summary (if any) from fp_contract_incumbent_subs
+        //    We aggregate here so it works even if the view is detailed.
+        const subsSql = `
+          SELECT
+            COUNT(*)                                    AS subaward_count,
+            COUNT(DISTINCT sub_uei)                     AS distinct_sub_recipients,
+            SUM(subaward_amount)                        AS total_subaward_amount,
+            ARRAY_AGG(
+              DISTINCT sub_name
+              ORDER BY subaward_amount DESC NULLS LAST
+            )[1:3]                                      AS sample_sub_names
+          FROM fp_contract_incumbent_subs
+          WHERE prime_piid = $1
+        `;
+        const { rows: subRows } = await client.query(subsSql, [piid]);
+        const subs = subRows[0] || {};
+        const subawardCount = Number(subs.subaward_count || 0);
+        const distinctSubs = Number(subs.distinct_sub_recipients || 0);
+        const totalSubAmt = Number(subs.total_subaward_amount || 0);
+        const sampleSubNames = Array.isArray(subs.sample_sub_names)
+          ? subs.sample_sub_names.filter(Boolean)
+          : [];
+
+        const subsLine =
+          subawardCount > 0
+            ? `There are about ${subawardCount} reported subawards (to ~${distinctSubs} vendors) totaling approximately $${totalSubAmt.toLocaleString(
+                "en-US",
+                { maximumFractionDigits: 0 }
+              )}. Notable subs: ${sampleSubNames.join(", ") || "names not disclosed"}.`
+            : `No contract subawards are visible in the public USAspending subaward data for this PIID.`;
+
+        // 3) Build prompt for the model
         const prompt = `
-You are helping a small federal contractor quickly understand a single contract.
+You are helping a small federal contractor quickly understand a single contract and its incumbent footprint.
 
-Contract snapshot:
+Prime contract snapshot:
 - PIID: ${a.award_id_piid}
 - Awarding agency: ${a.awarding_agency_name || "—"}
-- Sub-agency / office: ${a.awarding_sub_agency_name || "—"} / ${
-          a.awarding_office_name || "—"
-        }
-- Recipient: ${a.recipient_name || "—"}
+- Sub-agency / office: ${a.awarding_sub_agency_name || "—"} / ${a.awarding_office_name || "—"}
+- Prime contractor (incumbent): ${a.recipient_name || "—"}
 - NAICS: ${a.naics_code || "—"} – ${a.naics_description || "—"}
-- Period of performance: ${a.pop_start_date || "—"} to ${
-          a.pop_current_end_date || "—"
-        } (potential: ${a.pop_potential_end_date || "—"})
+- Period of performance: ${a.pop_start_date || "—"} to ${a.pop_current_end_date || "—"} (potential: ${a.pop_potential_end_date || "—"})
 - Total obligated: ${a.total_dollars_obligated_num || 0}
-- Current value (base + exercised): ${
-          a.current_total_value_of_award_num || 0
-        }
-- Ceiling (base + all options): ${
-          a.potential_total_value_of_award_num || 0
-        }
+- Current value (base + exercised): ${a.current_total_value_of_award_num || 0}
+- Ceiling (base + all options): ${a.potential_total_value_of_award_num || 0}
 
-In 3–5 bullet points, explain:
+Subaward / teaming snapshot:
+- ${subsLine}
+
+In 4–6 bullet points, explain:
 1) Where this contract is in its lifecycle (early / mid / near end).
 2) How heavily used it appears based on obligation vs ceiling.
-3) What a small business should consider if they want to compete on the recompete or as a teaming partner.
+3) What the subaward footprint suggests about teaming patterns (e.g., one key sub vs many small subs).
+4) Concrete ideas for how a small business could compete on the recompete or position as a teaming partner.
 
-Keep it under 180 words, concise, and non-technical.
+Keep it under 220 words, concise, and non-technical.
         `.trim();
 
+        // 4) Call OpenAI
         const aiRes = await fetch("https://api.openai.com/v1/chat/completions", {
           method: "POST",
           headers: {
@@ -414,11 +429,11 @@ Keep it under 180 words, concise, and non-technical.
               {
                 role: "system",
                 content:
-                  "You are a federal contracts analyst helping small businesses.",
+                  "You are a federal contracts analyst helping small businesses interpret USAspending data. Be practical, specific, and jargon-light.",
               },
               { role: "user", content: prompt },
             ],
-            max_tokens: 350,
+            max_tokens: 450,
           }),
         });
 
@@ -436,25 +451,17 @@ Keep it under 180 words, concise, and non-technical.
           aiJson.choices?.[0]?.message?.content?.trim() ||
           "AI produced no summary.";
 
-        return new Response(JSON.stringify({ ok: true, summary }), {
-          status: 200,
-          headers: { ...headers, "Content-Type": "application/json" },
-        });
+        return new Response(
+          JSON.stringify({ ok: true, summary }),
+          { status: 200, headers: { ...headers, "Content-Type": "application/json" } }
+        );
       } catch (e) {
         return new Response(
-          JSON.stringify({
-            ok: false,
-            error: e?.message || "AI insight failed",
-          }),
-          {
-            status: 500,
-            headers: { ...headers, "Content-Type": "application/json" },
-          }
+          JSON.stringify({ ok: false, error: e?.message || "AI insight failed" }),
+          { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
         );
       } finally {
-        try {
-          await client.end();
-        } catch {}
+        try { await client.end(); } catch {}
       }
     }
 
