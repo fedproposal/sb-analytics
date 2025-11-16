@@ -136,7 +136,7 @@ export default {
         ctx.waitUntil(client.end());
 
         return new Response(
-          JSON.stringify({ ok: true, rows }), // [{ name: "U.S. Special Operations Command" }, ...]
+          JSON.stringify({ ok: true, rows }),
           { status: 200, headers: { ...headers, "Content-Type": "application/json" } }
         );
       } catch (e) {
@@ -149,7 +149,7 @@ export default {
     }
 
     /* =============================================================
-     * 1) SB Agency Share (existing)
+     * 1) SB Agency Share
      *    GET /sb/agency-share?fy=2026&limit=12
      * =========================================================== */
     if (last === "agency-share") {
@@ -199,11 +199,8 @@ export default {
     }
 
     /* =============================================================
-     * 2) Expiring Contracts (Neon-backed)
+     * 2) Expiring Contracts
      *    GET /sb/expiring-contracts?naics=541519&agency=...&window_days=180&limit=50
-     *
-     *    NOTE: to keep performance reasonable on Neon (view), we use
-     *    equality on agency instead of ILIKE contains.
      * =========================================================== */
     if (last === "expiring-contracts") {
       const naicsParam = (url.searchParams.get("naics") || "").trim();
@@ -244,7 +241,7 @@ export default {
             AND ${COL.END_DATE} < CURRENT_DATE + $1::int
             AND (
               $2::text IS NULL
-              OR ${COL.AGENCY}    = $2
+              OR ${COL.AGENCY}     = $2
               OR ${COL.SUB_AGENCY} = $2
             )
             AND (
@@ -255,29 +252,29 @@ export default {
           LIMIT $4
         `;
 
-        const params = [
-          windowDays,                        // $1
-          agencyFilter || null,              // $2
-          naicsList.length ? naicsList : null, // $3
-          limit,                             // $4
-        ];
+      const params = [
+        windowDays,                        // $1
+        agencyFilter || null,              // $2
+        naicsList.length ? naicsList : null, // $3
+        limit,                             // $4
+      ];
 
-        const { rows } = await client.query(sql, params);
-        ctx.waitUntil(client.end());
+      const { rows } = await client.query(sql, params);
+      ctx.waitUntil(client.end());
 
-        const data = rows.map((r) => ({
-          piid: r.piid,
-          award_key: r.award_key,
-          agency: r.agency,
-          naics: r.naics,
-          end_date: r.end_date,
-          value: typeof r.value === "number" ? r.value : Number(r.value),
-        }));
+      const data = rows.map((r) => ({
+        piid: r.piid,
+        award_key: r.award_key,
+        agency: r.agency,
+        naics: r.naics,
+        end_date: r.end_date,
+        value: typeof r.value === "number" ? r.value : Number(r.value),
+      }));
 
-        return new Response(JSON.stringify({ ok: true, rows: data }), {
-          status: 200,
-          headers: { ...headers, "Content-Type": "application/json" },
-        });
+      return new Response(JSON.stringify({ ok: true, rows: data }), {
+        status: 200,
+        headers: { ...headers, "Content-Type": "application/json" },
+      });
       } catch (e) {
         try { await client.end(); } catch {}
         return new Response(
@@ -290,7 +287,6 @@ export default {
     /* =============================================================
      * 3) Contract insights (AI + subs)
      *    POST /sb/contracts/insights
-     *    Body: { piid: "HC102825F0042" }
      * =========================================================== */
     if (
       request.method === "POST" &&
@@ -352,29 +348,45 @@ export default {
 
         const a = awardRows[0];
 
-        // ---- 3b. Subaward snapshot directly from subawards table ----
-        const subsSql = `
+        // ---- 3b. Subaward summary ----
+        const subsSummarySql = `
           SELECT
-            COUNT(*)                          AS subaward_count,
-            COUNT(DISTINCT subawardee_uei)    AS distinct_sub_recipients,
-            COALESCE(SUM(subaward_amount),0)  AS total_subaward_amount,
-            ARRAY_REMOVE(
-              ARRAY_AGG(DISTINCT subawardee_name),
-              NULL
-            )                                 AS sample_sub_names
+            COUNT(*)                         AS subaward_count,
+            COUNT(DISTINCT subawardee_uei)   AS distinct_sub_recipients,
+            COALESCE(SUM(subaward_amount),0) AS total_subaward_amount
           FROM public.usaspending_contract_subawards
           WHERE prime_award_piid = $1
         `;
-        const { rows: subsRows } = await client.query(subsSql, [piid]);
-        const subsRow = subsRows[0] || {};
+        const { rows: subsSummaryRows } = await client.query(subsSummarySql, [piid]);
+        const subsSummaryRow = subsSummaryRows[0] || {};
+
+        // ---- 3c. Top subs rolled up by (name, uei) ----
+        const subsTopSql = `
+          SELECT
+            subawardee_name AS name,
+            subawardee_uei  AS uei,
+            SUM(subaward_amount) AS total_amount
+          FROM public.usaspending_contract_subawards
+          WHERE prime_award_piid = $1
+          GROUP BY subawardee_name, subawardee_uei
+          ORDER BY total_amount DESC
+          LIMIT 10
+        `;
+        const { rows: subsTopRows } = await client.query(subsTopSql, [piid]);
+
+        const topSubs = subsTopRows.map((r) => ({
+          name: r.name,
+          uei: r.uei,
+          amount: Number(r.total_amount || 0),
+        }));
 
         const subsSummary = {
-          count: Number(subsRow.subaward_count || 0),
-          distinctRecipients: Number(subsRow.distinct_sub_recipients || 0),
-          totalAmount: Number(subsRow.total_subaward_amount || 0),
-          top: Array.isArray(subsRow.sample_sub_names)
-            ? subsRow.sample_sub_names.slice(0, 5)
-            : [],
+          count: Number(subsSummaryRow.subaward_count || 0),
+          distinctRecipients: Number(
+            subsSummaryRow.distinct_sub_recipients || 0
+          ),
+          totalAmount: Number(subsSummaryRow.total_subaward_amount || 0),
+          top: topSubs,
         };
 
         const burnPct =
@@ -383,14 +395,27 @@ export default {
               Number(a.potential_total_value_of_award_num || 1)
             : null;
 
+        const topSubsText =
+          topSubs.length > 0
+            ? topSubs
+                .slice(0, 5)
+                .map(
+                  (s) =>
+                    `${s.name} (${s.uei || "no UEI"}, about ${fmtMoney(
+                      s.amount
+                    )})`
+                )
+                .join("; ")
+            : "none reported";
+
         const subsLine =
           subsSummary.count > 0
             ? `Subcontracts reported: ${subsSummary.count} actions, ${subsSummary.distinctRecipients} distinct subs, about ${fmtMoney(
                 subsSummary.totalAmount
-              )} total. Top subs: ${subsSummary.top.join(", ")}.`
+              )} total. Largest subs (name, UEI, approximate total): ${topSubsText}.`
             : "No subcontract awards are publicly reported for this PIID (data may be incomplete).";
 
-        // ---- 3c. Build AI prompt ----
+        // ---- 3d. Build AI prompt ----
         const prompt = `
 You are helping a small federal contractor quickly understand a single contract and where there may be opportunity.
 
@@ -429,7 +454,7 @@ In 4–6 concise bullet points, explain:
 Keep the tone practical and non-technical. Avoid repeating the same phrasing across bullets.
         `.trim();
 
-        // ---- 3d. Call OpenAI ----
+        // ---- 3e. Call OpenAI ----
         const aiRes = await fetch("https://api.openai.com/v1/chat/completions", {
           method: "POST",
           headers: {
