@@ -1,7 +1,7 @@
-// worker.js — sb-analytics (updated)
+// worker.js — sb-analytics
 import { Client } from "pg"
 
-// ---------- CORS helper ----------
+/* ========================= CORS ========================= */
 function cors(origin, env) {
   const list = (env?.CORS_ALLOW_ORIGINS || "")
     .split(",")
@@ -20,20 +20,19 @@ function cors(origin, env) {
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
     "Access-Control-Max-Age": "86400",
-    // Default = no-store; we override per-route where we want caching
     "Cache-Control": "no-store",
     Vary: "Origin",
   }
 }
 
-// Helper to re-attach CORS headers to cached responses
+// Re-attach CORS headers to cached responses
 function withCors(res, headers) {
   const h = new Headers(res.headers)
   for (const [k, v] of Object.entries(headers || {})) h.set(k, v)
   return new Response(res.body, { status: res.status, headers: h })
 }
 
-// ---------- DB client via Hyperdrive ----------
+/* ========================= DB client (Hyperdrive) ========================= */
 function makeClient(env) {
   return new Client({
     connectionString: env.HYPERDRIVE.connectionString,
@@ -41,39 +40,20 @@ function makeClient(env) {
   })
 }
 
-/**
- * ========================= COLUMN MAPPING =========================
- *
- * Table:
- *   public.usaspending_awards_v1
- */
+/* ========================= Column mapping ========================= */
 const USA_TABLE = "public.usaspending_awards_v1"
 
 const COL = {
-  // Date the current period of performance ends (DATE)
   END_DATE: "pop_current_end_date",
-
-  // NAICS code (TEXT)
   NAICS: "naics_code",
-
-  // Awarding agency name (TEXT)
   AGENCY: "awarding_agency_name",
-
-  // Awarding sub-agency / component (TEXT)
   SUB_AGENCY: "awarding_sub_agency_name",
-
-  // PIID / contract id (TEXT)
   PIID: "award_id_piid",
-
-  // Award key / identifier (TEXT)
   AWARD_ID: "award_key",
-
-  // Use *potential* total value (base + all options) as "Value"
   VALUE: "potential_total_value_of_award_num",
 }
-/* ================================================================= */
 
-// --- SAM entity website lookup (optional) ---
+/* ========================= Optional SAM helper ========================= */
 async function fetchVendorWebsiteByUEI(uei, env) {
   const key = env.SAM_API_KEY
   if (!key || !uei) return null
@@ -81,45 +61,43 @@ async function fetchVendorWebsiteByUEI(uei, env) {
     const u = new URL("https://api.sam.gov/entity-information/v2/entities")
     u.searchParams.set("ueiSAM", uei)
     u.searchParams.set("api_key", key)
-
-    // Cache aggressively at the edge (entity data is fairly static)
-    const r = await fetch(u.toString(), {
-      cf: { cacheTtl: 86400, cacheEverything: true },
-    })
+    const r = await fetch(u.toString(), { cf: { cacheTtl: 86400, cacheEverything: true } })
     if (!r.ok) return null
     const j = await r.json()
-
-    // Try common shapes
-    const ent = j?.entityRegistration || j?.entities?.[0] || j?.results?.[0]
+    const ent =
+      j?.entityRegistration ||
+      (Array.isArray(j?.entities) ? j.entities[0] : null) ||
+      (Array.isArray(j?.results) ? j.results[0] : null) ||
+      null
     const website =
       ent?.coreData?.businessInformation?.url ||
       ent?.coreData?.generalInformation?.corporateUrl ||
       ent?.coreData?.generalInformation?.url ||
       null
-
     return website && typeof website === "string" ? website.trim() : null
   } catch {
     return null
   }
 }
 
+/* ========================= Worker ========================= */
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url)
     const origin = request.headers.get("Origin") || ""
     const headers = cors(origin, env)
 
-    // ---------- Preflight ----------
+    // Preflight
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers })
     }
 
-    // ---------- Normalize path segments ----------
+    // Path parsing
     const segments = url.pathname.split("/").filter(Boolean)
     const last = segments[segments.length - 1] || ""
     const secondLast = segments.length > 1 ? segments[segments.length - 2] : ""
 
-    // ---------- Health ----------
+    /* ========================= Health ========================= */
     if (last === "health") {
       return new Response(JSON.stringify({ ok: true, db: true }), {
         status: 200,
@@ -127,24 +105,17 @@ export default {
       })
     }
 
-    /* =============================================================
-     * 0) Agencies list (for dropdown / datalist)
-     *    GET /sb/agencies
-     *    Returns top-level + sub-agencies + offices
-     *    (now cached at edge for 24h)
-     * =========================================================== */
+    /* ========================= Agencies (cached 24h) =========================
+     * GET /sb/agencies
+     */
     if (last === "agencies") {
-      // Edge cache first
       const cache = caches.default
       const cacheKey = new Request(url.toString(), request)
       const cached = await cache.match(cacheKey)
       if (cached) {
         return withCors(
           cached,
-          {
-            ...headers,
-            "Cache-Control": "public, s-maxage=86400, stale-while-revalidate=604800",
-          },
+          { ...headers, "Cache-Control": "public, s-maxage=86400, stale-while-revalidate=604800" },
         )
       }
 
@@ -154,22 +125,12 @@ export default {
         const sql = `
           SELECT DISTINCT name
           FROM (
-            SELECT awarding_agency_name      AS name
-            FROM ${USA_TABLE}
-            WHERE awarding_agency_name IS NOT NULL
-
+            SELECT awarding_agency_name      AS name FROM ${USA_TABLE} WHERE awarding_agency_name IS NOT NULL
             UNION
-
-            SELECT awarding_sub_agency_name AS name
-            FROM ${USA_TABLE}
-            WHERE awarding_sub_agency_name IS NOT NULL
-
+            SELECT awarding_sub_agency_name AS name FROM ${USA_TABLE} WHERE awarding_sub_agency_name IS NOT NULL
             UNION
-
-            SELECT awarding_office_name     AS name
-            FROM ${USA_TABLE}
-            WHERE awarding_office_name IS NOT NULL
-          ) AS x
+            SELECT awarding_office_name     AS name FROM ${USA_TABLE} WHERE awarding_office_name IS NOT NULL
+          ) x
           WHERE name IS NOT NULL
           ORDER BY name
           LIMIT 400;
@@ -188,19 +149,17 @@ export default {
         return res
       } catch (e) {
         try { await client.end() } catch {}
-        return new Response(
-          JSON.stringify({ ok: false, error: e?.message || "query failed" }),
-          { status: 500, headers: { ...headers, "Content-Type": "application/json" } },
-        )
+        return new Response(JSON.stringify({ ok: false, error: e?.message || "query failed" }), {
+          status: 500, headers: { ...headers, "Content-Type": "application/json" },
+        })
       } finally {
         try { await client.end() } catch {}
       }
     }
 
-    /* =============================================================
-     * 1) SB Agency Share (existing)
-     *    GET /sb/agency-share?fy=2026&limit=12
-     * =========================================================== */
+    /* ========================= SB Agency Share =========================
+     * GET /sb/agency-share?fy=2026&limit=12
+     */
     if (last === "agency-share") {
       const fy = parseInt(url.searchParams.get("fy") || "2026", 10)
       const limit = Math.max(1, Math.min(50, parseInt(url.searchParams.get("limit") || "12", 10)))
@@ -225,31 +184,27 @@ export default {
         }))
 
         return new Response(JSON.stringify({ ok: true, rows: data }), {
-          status: 200,
-          headers: { ...headers, "Content-Type": "application/json" },
+          status: 200, headers: { ...headers, "Content-Type": "application/json" },
         })
       } catch (e) {
         try { await client.end() } catch {}
         return new Response(JSON.stringify({ ok: false, error: e?.message || "query failed" }), {
-          status: 500,
-          headers: { ...headers, "Content-Type": "application/json" },
+          status: 500, headers: { ...headers, "Content-Type": "application/json" },
         })
       }
     }
 
-    /* =============================================================
-     * Vendor–Agency summary
-     *    GET /sb/vendor-summary?uei=XXXX&agency=Dept%20of%20Defense
-     * =========================================================== */
+    /* ========================= Vendor Summary =========================
+     * GET /sb/vendor-summary?uei=XXXX&agency=Dept%20of%20Defense
+     */
     if (last === "vendor-summary") {
       const uei = (url.searchParams.get("uei") || "").trim()
       const agencyFilter = (url.searchParams.get("agency") || "").trim()
 
       if (!uei) {
-        return new Response(
-          JSON.stringify({ ok: false, error: "Missing uei parameter." }),
-          { status: 400, headers: { ...headers, "Content-Type": "application/json" } },
-        )
+        return new Response(JSON.stringify({ ok: false, error: "Missing uei parameter." }), {
+          status: 400, headers: { ...headers, "Content-Type": "application/json" },
+        })
       }
 
       const client = makeClient(env)
@@ -269,9 +224,9 @@ export default {
         const summarySql = `
           SELECT
             fiscal_year,
-            COUNT(*)                                    AS awards,
-            SUM(total_dollars_obligated_num)           AS obligated,
-            SUM(potential_total_value_of_award_num)    AS ceiling
+            COUNT(*)                                 AS awards,
+            SUM(total_dollars_obligated_num)         AS obligated,
+            SUM(potential_total_value_of_award_num)  AS ceiling
           FROM ${USA_TABLE}
           WHERE recipient_uei = $1
             AND (
@@ -302,202 +257,52 @@ export default {
           { awards: 0, obligated: 0, ceiling: 0 },
         )
 
-        return new Response(
-          JSON.stringify({
-            ok: true,
-            vendor: { uei, name: vendorName },
-            agencyFilter: agencyFilter || null,
-            totals,
-            byYear,
-          }),
-          { status: 200, headers: { ...headers, "Content-Type": "application/json" } },
-        )
+        return new Response(JSON.stringify({
+          ok: true,
+          vendor: { uei, name: vendorName },
+          agencyFilter: agencyFilter || null,
+          totals,
+          byYear,
+        }), {
+          status: 200, headers: { ...headers, "Content-Type": "application/json" },
+        })
       } catch (e) {
         try { await client.end() } catch {}
         return new Response(JSON.stringify({ ok: false, error: e?.message || "query failed" }), {
-          status: 500,
-          headers: { ...headers, "Content-Type": "application/json" },
+          status: 500, headers: { ...headers, "Content-Type": "application/json" },
         })
       } finally {
         try { await client.end() } catch {}
       }
     }
-/* =============================================================
- * /sb/my-entity?uei=XXXX — merge SAM Entity + Registration
- * For Fit Score and display of your own company profile.
- * =========================================================== */
-if (last === "my-entity") {
-  const uei = (url.searchParams.get("uei") || "").trim()
-  if (!uei) {
-    return new Response(JSON.stringify({ ok:false, error:"Missing uei" }), {
-      status: 400, headers: { ...headers, "Content-Type":"application/json" },
-    })
-  }
-  try {
-    const base = env.SAM_BASE || "https://api.sam.gov"
-    const key  = env.SAM_API_KEY || ""
 
-    const eURL = new URL(`${base}/entity-information/v2/entities`)
-    eURL.searchParams.set("ueiSAM", uei)
-    if (key) eURL.searchParams.set("api_key", key)
-    const r1 = await fetch(eURL.toString())
-    const j1 = await r1.json().catch(()=> ({}))
-
-    const regURL = new URL(`${base}/entity-information/v2/registrations`)
-    regURL.searchParams.set("ueiSAM", uei)
-    if (key) regURL.searchParams.set("api_key", key)
-    const r2 = await fetch(regURL.toString())
-    const j2 = await r2.json().catch(()=> ({}))
-
-    const ent  = j1?.entityList?.[0] || j1?.entities?.[0] || j1?.entity || {}
-    const reg  = j2?.entityRegistration || j2?.registrations?.[0] || {}
-
-    const name =
-      ent?.legalBusinessName ||
-      reg?.coreData?.generalInformation?.legalBusinessName || null
-
-    const website =
-      reg?.coreData?.businessInformation?.url ||
-      ent?.corporateUrl || null
-
-    const phys = reg?.coreData?.physicalAddress || {}
-    const naics = Array.from(new Set(
-      ((reg?.assertions?.primaryNAICS || []) as any[])
-        .concat(reg?.assertions?.additionalNAICS || [])
-        .map((x:any) => x?.code || x)
-        .filter(Boolean)
-    ))
-
-    const socio = (reg?.assertions?.socioEconomic?.list || [])
-
-    return new Response(JSON.stringify({
-      ok: true,
-      entity: {
-        uei, name, website,
-        address: {
-          line: phys?.addressLine1 || null,
-          city: phys?.city || null,
-          state: phys?.stateOrProvinceCode || null,
-          zip: phys?.zipCode || null,
-        },
-        naics,
-        socio,
-        registrationStatus: reg?.registrationStatus || null,
-      }
-    }), { status: 200, headers: { ...headers, "Content-Type":"application/json" } })
-  } catch (e) {
-    return new Response(JSON.stringify({ ok:false, error: e?.message || "SAM lookup failed" }), {
-      status: 500, headers: { ...headers, "Content-Type":"application/json" },
-    })
-  }
-}
-/* =============================================================
- * /sb/my-entity?uei=XXXX — merge SAM Entity + Registration
- * For Fit Score and showing your own company profile
- * =========================================================== */
-if (last === "my-entity") {
-  const uei = (url.searchParams.get("uei") || "").trim()
-  if (!uei) {
-    return new Response(JSON.stringify({ ok:false, error:"Missing uei" }), {
-      status: 400, headers: { ...headers, "Content-Type":"application/json" },
-    })
-  }
-  try {
-    const base = env.SAM_BASE || "https://api.sam.gov"
-    const key  = env.SAM_API_KEY || ""
-
-    const eURL = new URL(`${base}/entity-information/v2/entities`)
-    eURL.searchParams.set("ueiSAM", uei)
-    if (key) eURL.searchParams.set("api_key", key)
-    const r1 = await fetch(eURL.toString())
-    const j1 = await r1.json().catch(()=> ({}))
-
-    const regURL = new URL(`${base}/entity-information/v2/registrations`)
-    regURL.searchParams.set("ueiSAM", uei)
-    if (key) regURL.searchParams.set("api_key", key)
-    const r2 = await fetch(regURL.toString())
-    const j2 = await r2.json().catch(()=> ({}))
-
-    const ent  = j1?.entityList?.[0] || j1?.entities?.[0] || j1?.entity || {}
-    const reg  = j2?.entityRegistration || j2?.registrations?.[0] || {}
-
-    const name =
-      ent?.legalBusinessName ||
-      reg?.coreData?.generalInformation?.legalBusinessName || null
-
-    const website =
-      reg?.coreData?.businessInformation?.url ||
-      ent?.corporateUrl || null
-
-    const phys = reg?.coreData?.physicalAddress || {}
-    const naics = Array.from(new Set(
-      ((reg?.assertions?.primaryNAICS || []) as any[])
-        .concat(reg?.assertions?.additionalNAICS || [])
-        .map((x:any) => x?.code || x)
-        .filter(Boolean)
-    ))
-
-    const socio = (reg?.assertions?.socioEconomic?.list || [])
-
-    return new Response(JSON.stringify({
-      ok: true,
-      entity: {
-        uei, name, website,
-        address: {
-          line: phys?.addressLine1 || null,
-          city: phys?.city || null,
-          state: phys?.stateOrProvinceCode || null,
-          zip: phys?.zipCode || null,
-        },
-        naics,
-        socio,
-        registrationStatus: reg?.registrationStatus || null,
-      }
-    }), { status: 200, headers: { ...headers, "Content-Type":"application/json" } })
-  } catch (e) {
-    return new Response(JSON.stringify({ ok:false, error: e?.message || "SAM lookup failed" }), {
-      status: 500, headers: { ...headers, "Content-Type":"application/json" },
-    })
-  }
-}
-    
-    
-    /* =============================================================
-     * 2) Expiring Contracts (Neon-backed)
-     *    GET /sb/expiring-contracts?naics=541519&agency=VA&window_days=180&limit=50
-     *    Equality match for agency/sub/office (no contains scans).
-     *    Now uses edge caching for 5 minutes.
-     * =========================================================== */
+    /* ========================= Expiring Contracts (cached 5m) =========================
+     * GET /sb/expiring-contracts?naics=541519&agency=VA&window_days=180&limit=50
+     */
     if (last === "expiring-contracts") {
-      const naicsParam = (url.searchParams.get("naics") || "").trim()
+      const naicsParam   = (url.searchParams.get("naics") || "").trim()
       const agencyFilter = (url.searchParams.get("agency") || "").trim()
-      const windowDays = Math.max(1, Math.min(365, parseInt(url.searchParams.get("window_days") || "180", 10)))
-      const limit = Math.max(1, Math.min(200, parseInt(url.searchParams.get("limit") || "100", 10)))
+      const windowDays   = Math.max(1, Math.min(365, parseInt(url.searchParams.get("window_days") || "180", 10)))
+      const limit        = Math.max(1, Math.min(200, parseInt(url.searchParams.get("limit") || "100", 10)))
 
       const naicsList =
         naicsParam.length > 0
           ? naicsParam.split(",").map((s) => s.trim()).filter(Boolean)
           : []
 
-      // Edge cache first (key = full URL)
       const cache = caches.default
       const cacheKey = new Request(url.toString(), request)
       const cached = await cache.match(cacheKey)
       if (cached) {
         return withCors(
           cached,
-          {
-            ...headers,
-            "Cache-Control": "public, s-maxage=300, stale-while-revalidate=86400",
-          },
+          { ...headers, "Cache-Control": "public, s-maxage=300, stale-while-revalidate=86400" },
         )
       }
 
       const client = makeClient(env)
       try {
         await client.connect()
-
-        // Optional: keep very long scans from locking the request
         try { await client.query("SET statement_timeout = '55s'") } catch {}
 
         const sql = `
@@ -514,9 +319,9 @@ if (last === "my-entity") {
             AND ${COL.END_DATE} < CURRENT_DATE + $1::int
             AND (
               $2::text IS NULL
-              OR ${COL.AGENCY}            = $2
-              OR ${COL.SUB_AGENCY}        = $2
-              OR awarding_office_name     = $2
+              OR ${COL.AGENCY}        = $2
+              OR ${COL.SUB_AGENCY}    = $2
+              OR awarding_office_name = $2
             )
             AND (
               $3::text[] IS NULL
@@ -551,143 +356,135 @@ if (last === "my-entity") {
       } catch (e) {
         try { await client.end() } catch {}
         return new Response(JSON.stringify({ ok: false, error: e?.message || "query failed" }), {
-          status: 500,
-          headers: { ...headers, "Content-Type": "application/json" },
+          status: 500, headers: { ...headers, "Content-Type": "application/json" },
         })
       }
     }
-/* =============================================================
- * Vendor awards list (last N fiscal years, filtered by agency)
- *    GET /sb/vendor-awards?uei=XXXX&agency=Dept%20of%20Defense&years=5&limit=100
- * Robust to missing fiscal_year column.
- * =========================================================== */
-if (last === "vendor-awards") {
-  const uei = (url.searchParams.get("uei") || "").trim()
-  const agency = (url.searchParams.get("agency") || "").trim()
-  const years = Math.max(1, Math.min(10, parseInt(url.searchParams.get("years") || "5", 10)))
-  const limit = Math.max(1, Math.min(300, parseInt(url.searchParams.get("limit") || "100", 10)))
 
-  if (!uei) {
-    return new Response(JSON.stringify({ ok: false, error: "Missing uei" }), {
-      status: 400, headers: { ...headers, "Content-Type": "application/json" },
-    })
-  }
+    /* ========================= Vendor Awards (FY fallback) =========================
+     * GET /sb/vendor-awards?uei=XXXX&agency=...&years=5&limit=100
+     */
+    if (last === "vendor-awards") {
+      const uei   = (url.searchParams.get("uei") || "").trim()
+      const agency = (url.searchParams.get("agency") || "").trim()
+      const years = Math.max(1, Math.min(10, parseInt(url.searchParams.get("years") || "5", 10)))
+      const limit = Math.max(1, Math.min(300, parseInt(url.searchParams.get("limit") || "100", 10)))
 
-  const client = makeClient(env)
-  try {
-    await client.connect()
-    try { await client.query("SET statement_timeout = '15000'") } catch {}
+      if (!uei) {
+        return new Response(JSON.stringify({ ok: false, error: "Missing uei" }), {
+          status: 400, headers: { ...headers, "Content-Type": "application/json" },
+        })
+      }
 
-    // Column discovery
-    const schema = USA_TABLE.includes(".") ? USA_TABLE.split(".")[0] : "public"
-    const table  = USA_TABLE.includes(".") ? USA_TABLE.split(".")[1] : USA_TABLE
-    const colsRes = await client.query(
-      `SELECT column_name FROM information_schema.columns
-       WHERE table_schema = $1 AND table_name = $2`,
-      [schema, table]
-    )
-    const have = new Set((colsRes.rows || []).map(r => String(r.column_name).toLowerCase()))
-    const has = (c) => have.has(String(c).toLowerCase())
+      const client = makeClient(env)
+      try {
+        await client.connect()
+        try { await client.query("SET statement_timeout = '15000'") } catch {}
 
-    // Build the best available fiscal-year expression
-    // Preference order: explicit FY column → action_date FY → PoP end FY → current year
-    let fyExpr = null
-    if (has("fiscal_year")) {
-      fyExpr = "fiscal_year"
-    } else if (has("action_date_fiscal_year")) {
-      fyExpr = "action_date_fiscal_year"
-    } else if (has("action_date")) {
-      fyExpr = `CASE WHEN EXTRACT(MONTH FROM action_date)::int >= 10
-                    THEN EXTRACT(YEAR FROM action_date)::int + 1
-                    ELSE EXTRACT(YEAR FROM action_date)::int
-               END`
-    } else if (has("pop_current_end_date")) {
-      fyExpr = `CASE WHEN EXTRACT(MONTH FROM pop_current_end_date)::int >= 10
-                    THEN EXTRACT(YEAR FROM pop_current_end_date)::int + 1
-                    ELSE EXTRACT(YEAR FROM pop_current_end_date)::int
-               END`
-    } else if (has("period_of_performance_current_end_date")) {
-      fyExpr = `CASE WHEN EXTRACT(MONTH FROM period_of_performance_current_end_date)::int >= 10
-                    THEN EXTRACT(YEAR FROM period_of_performance_current_end_date)::int + 1
-                    ELSE EXTRACT(YEAR FROM period_of_performance_current_end_date)::int
-               END`
-    } else {
-      fyExpr = "EXTRACT(YEAR FROM CURRENT_DATE)::int" // worst-case fallback
+        const schema = USA_TABLE.includes(".") ? USA_TABLE.split(".")[0] : "public"
+        const table  = USA_TABLE.includes(".") ? USA_TABLE.split(".")[1] : USA_TABLE
+        const colsRes = await client.query(
+          `SELECT column_name FROM information_schema.columns
+           WHERE table_schema = $1 AND table_name = $2`,
+          [schema, table]
+        )
+        const have = new Set((colsRes.rows || []).map(r => String(r.column_name).toLowerCase()))
+        const has = (c) => have.has(String(c).toLowerCase())
+
+        let fyExpr = null
+        if (has("fiscal_year")) {
+          fyExpr = "fiscal_year"
+        } else if (has("action_date_fiscal_year")) {
+          fyExpr = "action_date_fiscal_year"
+        } else if (has("action_date")) {
+          fyExpr = `CASE WHEN EXTRACT(MONTH FROM action_date)::int >= 10
+                        THEN EXTRACT(YEAR FROM action_date)::int + 1
+                        ELSE EXTRACT(YEAR FROM action_date)::int
+                   END`
+        } else if (has("pop_current_end_date")) {
+          fyExpr = `CASE WHEN EXTRACT(MONTH FROM pop_current_end_date)::int >= 10
+                        THEN EXTRACT(YEAR FROM pop_current_end_date)::int + 1
+                        ELSE EXTRACT(YEAR FROM pop_current_end_date)::int
+                   END`
+        } else if (has("period_of_performance_current_end_date")) {
+          fyExpr = `CASE WHEN EXTRACT(MONTH FROM period_of_performance_current_end_date)::int >= 10
+                        THEN EXTRACT(YEAR FROM period_of_performance_current_end_date)::int + 1
+                        ELSE EXTRACT(YEAR FROM period_of_performance_current_end_date)::int
+                   END`
+        } else {
+          fyExpr = "EXTRACT(YEAR FROM CURRENT_DATE)::int"
+        }
+
+        const setAsideExpr = (() => {
+          const c = ["type_of_set_aside","type_set_aside","set_aside"].filter(has)
+          return c.length ? `COALESCE(${c.map(n=>`${n}::text`).join(",")})` : "NULL"
+        })()
+
+        const vehicleExpr = (() => {
+          const c = ["idv_type","idv_type_of_award","contract_vehicle","contract_award_type","award_type"].filter(has)
+          return c.length ? `COALESCE(${c.map(n=>`${n}::text`).join(",")})` : "NULL"
+        })()
+
+        const sql = `
+          SELECT *
+          FROM (
+            SELECT
+              award_id_piid                               AS piid,
+              (${fyExpr})                                 AS fiscal_year,
+              awarding_agency_name                        AS agency,
+              awarding_sub_agency_name                    AS sub_agency,
+              awarding_office_name                        AS office,
+              naics_code                                  AS naics,
+              ${setAsideExpr}                             AS set_aside,
+              ${vehicleExpr}                              AS vehicle,
+              total_dollars_obligated_num                 AS obligated,
+              pop_current_end_date                        AS pop_end
+            FROM ${USA_TABLE}
+            WHERE recipient_uei = $1
+              AND (
+                $2::text IS NULL
+                OR awarding_agency_name      = $2
+                OR awarding_sub_agency_name  = $2
+                OR awarding_office_name      = $2
+              )
+          ) q
+          WHERE q.fiscal_year >= EXTRACT(YEAR FROM CURRENT_DATE)::int - ($3::int - 1)
+          ORDER BY q.fiscal_year DESC, q.pop_end DESC NULLS LAST, q.piid DESC
+          LIMIT $4
+        `
+        const params = [uei, agency || null, years, limit]
+        const { rows } = await client.query(sql, params)
+        ctx.waitUntil(client.end())
+
+        const data = (rows || []).map(r => ({
+          piid: r.piid,
+          fiscal_year: Number(r.fiscal_year),
+          agency: r.agency, sub_agency: r.sub_agency, office: r.office,
+          naics: r.naics,
+          set_aside: r.set_aside || null,
+          vehicle: r.vehicle || null,
+          obligated: typeof r.obligated === "number" ? r.obligated : Number(r.obligated || 0),
+        }))
+
+        return new Response(JSON.stringify({ ok: true, rows: data }), {
+          status: 200, headers: { ...headers, "Content-Type": "application/json" },
+        })
+      } catch (e) {
+        try { await client.end() } catch {}
+        return new Response(JSON.stringify({ ok: false, error: e?.message || "query failed" }), {
+          status: 500, headers: { ...headers, "Content-Type": "application/json" },
+        })
+      }
     }
 
-    const setAsideExpr = (() => {
-      const c = ["type_of_set_aside","type_set_aside","set_aside"].filter(has)
-      return c.length ? `COALESCE(${c.map(n=>`${n}::text`).join(",")})` : "NULL"
-    })()
-
-    const vehicleExpr = (() => {
-      const c = ["idv_type","idv_type_of_award","contract_vehicle","contract_award_type","award_type"].filter(has)
-      return c.length ? `COALESCE(${c.map(n=>`${n}::text`).join(",")})` : "NULL"
-    })()
-
-    // Use a subquery to compute FY once and filter/rank on it
-    const sql = `
-      SELECT *
-      FROM (
-        SELECT
-          award_id_piid                                   AS piid,
-          (${fyExpr})                                     AS fiscal_year,
-          awarding_agency_name                            AS agency,
-          awarding_sub_agency_name                        AS sub_agency,
-          awarding_office_name                            AS office,
-          naics_code                                      AS naics,
-          ${setAsideExpr}                                 AS set_aside,
-          ${vehicleExpr}                                  AS vehicle,
-          total_dollars_obligated_num                     AS obligated,
-          pop_current_end_date                            AS pop_end
-        FROM ${USA_TABLE}
-        WHERE recipient_uei = $1
-          AND (
-            $2::text IS NULL
-            OR awarding_agency_name      = $2
-            OR awarding_sub_agency_name  = $2
-            OR awarding_office_name      = $2
-          )
-      ) q
-      WHERE q.fiscal_year >= EXTRACT(YEAR FROM CURRENT_DATE)::int - ($3::int - 1)
-      ORDER BY q.fiscal_year DESC, q.pop_end DESC NULLS LAST, q.piid DESC
-      LIMIT $4
-    `
-    const params = [uei, agency || null, years, limit]
-    const { rows } = await client.query(sql, params)
-    ctx.waitUntil(client.end())
-
-    const data = (rows || []).map(r => ({
-      piid: r.piid,
-      fiscal_year: Number(r.fiscal_year),
-      agency: r.agency, sub_agency: r.sub_agency, office: r.office,
-      naics: r.naics,
-      set_aside: r.set_aside || null,
-      vehicle: r.vehicle || null,
-      obligated: typeof r.obligated === "number" ? r.obligated : Number(r.obligated || 0),
-    }))
-
-    return new Response(JSON.stringify({ ok: true, rows: data }), {
-      status: 200, headers: { ...headers, "Content-Type": "application/json" },
-    })
-  } catch (e) {
-    try { await client.end() } catch {}
-    return new Response(JSON.stringify({ ok: false, error: e?.message || "query failed" }), {
-      status: 500, headers: { ...headers, "Content-Type": "application/json" },
-    })
-  }
-}
-    /* =============================================================
-     * 3) Contract insights (AI + subcontracts)
-     *    POST /sb/contracts/insights  { piid: "HC102825F0042" }
-     *    Enriched with vendor website via SAM (if SAM_API_KEY is set)
-     * =========================================================== */
+    /* ========================= Contract Insights (AI + subs) =========================
+     * POST /sb/contracts/insights  { piid: "..." }
+     */
     if (request.method === "POST" && url.pathname.toLowerCase().endsWith("/contracts/insights")) {
       if (!env.OPENAI_API_KEY) {
-        return new Response(
-          JSON.stringify({ ok: false, error: "OPENAI_API_KEY is not configured for sb-analytics." }),
-          { status: 500, headers: { ...headers, "Content-Type": "application/json" } },
-        )
+        return new Response(JSON.stringify({ ok: false, error: "OPENAI_API_KEY is not configured for sb-analytics." }), {
+          status: 500, headers: { ...headers, "Content-Type": "application/json" },
+        })
       }
 
       const client = makeClient(env)
@@ -702,7 +499,6 @@ if (last === "vendor-awards") {
 
         await client.connect()
 
-        // ---- 3a. Core award snapshot ----
         const awardSql = `
           SELECT
             award_id_piid,
@@ -740,7 +536,6 @@ if (last === "vendor-awards") {
           toNumber(a.potential_total_value_of_award_num) ?? 0
         const ceiling = toNumber(a.potential_total_value_of_award_num) ?? currentValue
 
-        // ---- 3b. Lifecycle and window ----
         const today = new Date()
         const parseDate = (d) => (d ? new Date(d) : null)
         const startDate = parseDate(a.pop_start_date)
@@ -773,11 +568,8 @@ if (last === "vendor-awards") {
           }
         }
 
-        if (ceiling && ceiling > 0) {
-          burnPct = Math.round((obligated / ceiling) * 100)
-        }
+        if (ceiling && ceiling > 0) burnPct = Math.round((obligated / ceiling) * 100)
 
-        // ---- 3c. Subcontracts ----
         const subsSql = `
           SELECT subawardee_name, subawardee_uei, subaward_amount
           FROM public.usaspending_contract_subawards
@@ -812,10 +604,6 @@ if (last === "vendor-awards") {
           largestSubPct = Math.round((topSubs[0].amount / totalSubAmount) * 100)
         }
 
-        const disclaimer =
-          "Subcontractor data is sourced from USAspending. Primes are not required to report every subcontract, so this list may be incomplete."
-
-        // ---- 3d. Primary block ----
         const primary = {
           piid: a.award_id_piid,
           agency: a.awarding_agency_name || null,
@@ -833,7 +621,6 @@ if (last === "vendor-awards") {
           ceiling,
         }
 
-        // Enrich with website (optional)
         const website = await fetchVendorWebsiteByUEI(primary.primeUei, env)
         if (website) primary.website = website
 
@@ -854,46 +641,24 @@ if (last === "vendor-awards") {
           top: topSubs,
         }
 
-        // ---- 3e. AI summary ----
         const burnText =
           burnPct == null
             ? "Burn vs. ceiling could not be determined."
-            : `Approximately ${burnPct}% of the contract ceiling is obligated (≈$${Math.round(
-                obligated,
-              ).toLocaleString("en-US")} of ≈$${Math.round(ceiling).toLocaleString("en-US")}).`
-
-        const lifecycleText =
-          lifecycleStage === "not_started"
-            ? "The contract has not yet started."
-            : lifecycleStage === "complete"
-            ? "The contract’s period of performance appears to be complete."
-            : lifecycleStage === "early"
-            ? "The contract is in its early stage of performance."
-            : lifecycleStage === "mid"
-            ? "The contract is mid-way through its performance period."
-            : lifecycleStage === "late"
-            ? "The contract is late in its performance period (near the end)."
-            : "Lifecycle stage is limited due to incomplete dates."
+            : `Approximately ${burnPct}% of the contract ceiling is obligated (≈$${Math.round(obligated).toLocaleString("en-US")} of ≈$${Math.round(ceiling).toLocaleString("en-US")}).`
 
         const subsText =
           subCount === 0
             ? "No subcontract awards are publicly reported for this contract; teaming may require direct outreach to the prime."
-            : `There are ${subCount} reported subawards to ${distinctRecipients} unique recipients, totaling about $${Math.round(
-                totalSubAmount,
-              ).toLocaleString("en-US")}.`
+            : `There are ${subCount} reported subawards to ${distinctRecipients} unique recipients, totaling about $${Math.round(totalSubAmount).toLocaleString("en-US")}.`
 
         const topSubText =
           topSubs.length === 0
             ? ""
-            : `Top reported subs include ${topSubs
-                .slice(0, 3)
-                .map((s) => `${s.name} (UEI ${s.uei || "unknown"})`)
-                .join(", ")}.`
+            : `Top reported subs include ${topSubs.slice(0, 3).map((s) => `${s.name} (UEI ${s.uei || "unknown"})`).join(", ")}.`
 
         const prompt = `
 You are helping a small federal contractor quickly understand a single contract and how to position for a recompete or subcontracting role.
-
-Treat the lifecycle, burn %, and subcontracting figures below as correct. Do not contradict them.
+Treat the lifecycle, burn %, and subcontracting figures below as correct.
 
 Contract snapshot:
 - PIID: ${primary.piid}
@@ -902,12 +667,11 @@ Contract snapshot:
 - Prime: ${primary.primeName || "—"} (UEI: ${primary.primeUei || "unknown"})${website ? ` — Website: ${website}` : ""}
 - NAICS: ${primary.naicsCode || "—"} – ${primary.naicsDescription || "—"}
 - Period of performance: ${primary.popStartDate || "—"} to ${primary.popCurrentEndDate || "—"} (potential: ${primary.popPotentialEndDate || "—"})
-- Lifecycle stage: ${lifecycleStage} (${lifecycle.label}, time elapsed ≈${timeElapsedPct == null ? "unknown" : timeElapsedPct + "%"})
+- Lifecycle stage: ${lifecycle.stage} (${lifecycle.label}, time elapsed ≈${timeElapsedPct == null ? "unknown" : timeElapsedPct + "%"})
 - ${burnText}
 - Subcontracting footprint: ${subsText} ${topSubText}
 
-Write 4–5 bullet points that are tailored to the current lifecycle stage.
-Keep it under 180 words, concise, and non-technical.
+Write 4–5 bullet points tailored to the lifecycle stage (pre-capture if NOT_STARTED, capture if EARLY/MID, recompete if LATE/COMPLETE). Be specific to the agency/office/prime. ≤180 words.
         `.trim()
 
         const aiRes = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -930,10 +694,11 @@ Keep it under 180 words, concise, and non-technical.
         }
         const summary = aiJson.choices?.[0]?.message?.content?.trim() || "AI produced no summary."
 
-        return new Response(
-          JSON.stringify({ ok: true, summary, primary, lifecycle, subs, disclaimer }),
-          { status: 200, headers: { ...headers, "Content-Type": "application/json" } },
-        )
+        return new Response(JSON.stringify({ ok: true, summary, primary, lifecycle, subs, disclaimer:
+          "Subcontractor data is sourced from USAspending. Primes are not required to report every subcontract, so this list may be incomplete."
+        }), {
+          status: 200, headers: { ...headers, "Content-Type": "application/json" },
+        })
       } catch (e) {
         return new Response(JSON.stringify({ ok: false, error: e?.message || "AI insight failed" }), {
           status: 500, headers: { ...headers, "Content-Type": "application/json" },
@@ -942,74 +707,78 @@ Keep it under 180 words, concise, and non-technical.
         try { await client.end() } catch {}
       }
     }
-/* =============================================================
- * MY ENTITY
- *   GET /sb/my-entity?uei=XXXX
- *   -> { ok: true, entity: { uei, name, naics:[...], smallBizCategories:[...] } }
- * =========================================================== */
-if (last === "my-entity") {
-  const uei = (url.searchParams.get("uei") || "").trim().toUpperCase()
-  if (!uei) {
-    return new Response(JSON.stringify({ ok:false, error:"Missing uei parameter." }), {
-      status:400, headers:{ ...headers, "Content-Type":"application/json" }
-    })
-  }
 
-  const client = makeClient(env)
-  try {
-    await client.connect()
-
-    // Best-effort name from awards
-    const nameRes = await client.query(
-      `SELECT recipient_name
-       FROM ${USA_TABLE}
-       WHERE recipient_uei = $1
-       ORDER BY total_dollars_obligated_num DESC NULLS LAST
-       LIMIT 1`, [uei]
-    )
-    const name = nameRes.rows[0]?.recipient_name || null
-
-    // NAICS from awards
-    const naicsRes = await client.query(
-      `SELECT DISTINCT naics_code
-       FROM ${USA_TABLE}
-       WHERE recipient_uei = $1 AND naics_code IS NOT NULL
-       LIMIT 200`, [uei]
-    )
-    const naics = (naicsRes.rows || []).map(r => r.naics_code).filter(Boolean)
-
-    // Optional SAM enrichment (prime/company socio-econ categories)
-    let smallBizCategories = []
-    try {
-      if (env.SAM_PROXY_URL) {
-        const samUrl = `${env.SAM_PROXY_URL.replace(/\/+$/, "")}/entity?uei=${encodeURIComponent(uei)}`
-        const samRes = await fetch(samUrl)
-        if (samRes.ok) {
-          const samJson = await samRes.json().catch(() => null)
-          const cats =
-            samJson?.categories ||
-            samJson?.entity?.socioEconomicCategories || []
-          smallBizCategories = Array.from(new Set((cats || []).filter(Boolean)))
-        }
+    /* ========================= MY ENTITY =========================
+     * GET /sb/my-entity?uei=XXXX
+     * -> { ok: true, entity: { uei, name, naics:[...], smallBizCategories:[...] } }
+     * - Name & NAICS from USAspending (Neon)
+     * - Optional smallBizCategories via SAM proxy (env.SAM_PROXY_URL)
+     */
+    if (last === "my-entity") {
+      const uei = (url.searchParams.get("uei") || "").trim().toUpperCase()
+      if (!uei) {
+        return new Response(JSON.stringify({ ok:false, error:"Missing uei parameter." }), {
+          status:400, headers:{ ...headers, "Content-Type":"application/json" }
+        })
       }
-    } catch {}
 
-    return new Response(
-      JSON.stringify({ ok:true, entity:{ uei, name, naics, smallBizCategories } }),
-      { status:200, headers:{ ...headers, "Content-Type":"application/json" } }
-    )
-  } catch (e) {
-    try { await client.end() } catch {}
-    return new Response(JSON.stringify({ ok:false, error:e?.message || "query failed" }), {
-      status:500, headers:{ ...headers, "Content-Type":"application/json" }
-    })
-  } finally {
-    try { await client.end() } catch {}
-  }
-}
+      const client = makeClient(env)
+      try {
+        await client.connect()
 
-    
-    // ---------- Fallback ----------
+        // Best-effort name (from awards)
+        const nameRes = await client.query(
+          `SELECT recipient_name
+           FROM ${USA_TABLE}
+           WHERE recipient_uei = $1
+           ORDER BY total_dollars_obligated_num DESC NULLS LAST
+           LIMIT 1`, [uei]
+        )
+        const name = nameRes.rows[0]?.recipient_name || null
+
+        // NAICS set (from awards)
+        const naicsRes = await client.query(
+          `SELECT DISTINCT naics_code
+           FROM ${USA_TABLE}
+           WHERE recipient_uei = $1 AND naics_code IS NOT NULL
+           LIMIT 200`, [uei]
+        )
+        const naics = (naicsRes.rows || []).map(r => r.naics_code).filter(Boolean)
+
+        // Optional: socio-economic categories from your SAM proxy
+        let smallBizCategories = []
+        try {
+          if (env.SAM_PROXY_URL) {
+            const samUrl = `${env.SAM_PROXY_URL.replace(/\/+$/, "")}/entity?uei=${encodeURIComponent(uei)}`
+            const samRes = await fetch(samUrl)
+            if (samRes.ok) {
+              const samJson = await samRes.json().catch(() => null)
+              const cats =
+                (Array.isArray(samJson?.categories) && samJson.categories) ||
+                (samJson?.entity?.socioEconomicCategories || [])
+              smallBizCategories = Array.from(new Set((cats || []).filter(Boolean)))
+            }
+          }
+        } catch {}
+
+        return new Response(JSON.stringify({
+          ok: true,
+          entity: { uei, name, naics, smallBizCategories },
+        }), {
+          status: 200,
+          headers: { ...headers, "Content-Type": "application/json", "Cache-Control": "public, s-maxage=86400" },
+        })
+      } catch (e) {
+        try { await client.end() } catch {}
+        return new Response(JSON.stringify({ ok:false, error:e?.message || "query failed" }), {
+          status:500, headers:{ ...headers, "Content-Type":"application/json" }
+        })
+      } finally {
+        try { await client.end() } catch {}
+      }
+    }
+
+    // Fallback
     return new Response("Not found", { status: 404, headers })
   },
 }
