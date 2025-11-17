@@ -1,10 +1,16 @@
-// worker.js — sb-analytics (final)
+// worker.js — sb-analytics (v2)
+// Points to public.usaspending_awards_v2 and adds bid/no-bid + teaming suggestions
+
 import { Client } from "pg"
 
-/* ---------- CORS ---------- */
+/* ========================= CORS ========================= */
 function cors(origin, env) {
-  const list = (env?.CORS_ALLOW_ORIGINS || "").split(",").map(s=>s.trim()).filter(Boolean)
-  const allow = list.length === 0 || list.includes("*") ? (origin || "*") : (list.includes(origin) ? origin : list[0])
+  const list = (env?.CORS_ALLOW_ORIGINS || "")
+    .split(",").map(s => s.trim()).filter(Boolean)
+  const allow =
+    list.length === 0 || list.includes("*")
+      ? origin || "*"
+      : list.includes(origin) ? origin : list[0]
   return {
     "Access-Control-Allow-Origin": allow || "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -16,44 +22,35 @@ function cors(origin, env) {
 }
 function withCors(res, headers) {
   const h = new Headers(res.headers)
-  for (const [k,v] of Object.entries(headers||{})) h.set(k,v)
+  for (const [k, v] of Object.entries(headers || {})) h.set(k, v)
   return new Response(res.body, { status: res.status, headers: h })
 }
 
-/* ---------- DB ---------- */
+/* ========================= DB client ========================= */
 function makeClient(env) {
-  return new Client({ connectionString: env.HYPERDRIVE.connectionString, ssl: { rejectUnauthorized: false } })
+  return new Client({
+    connectionString: env.HYPERDRIVE.connectionString,
+    ssl: { rejectUnauthorized: false },
+  })
 }
 
+/* ========================= Column mapping ========================= */
+// 👉 Use your v2 view that you created from usaspending_contract_awards
 const USA_TABLE = "public.usaspending_awards_v2"
+
+// Standard column aliases present in v2
 const COL = {
   END_DATE: "pop_current_end_date",
   NAICS: "naics_code",
   AGENCY: "awarding_agency_name",
   SUB_AGENCY: "awarding_sub_agency_name",
+  OFFICE: "awarding_office_name",
   PIID: "award_id_piid",
   AWARD_ID: "award_key",
   VALUE: "potential_total_value_of_award_num",
 }
 
-/* ---------- helpers ---------- */
-async function getColumns(client, tableFqn) {
-  const schema = tableFqn.includes(".") ? tableFqn.split(".")[0] : "public"
-  const table  = tableFqn.includes(".") ? tableFqn.split(".")[1] : tableFqn
-  const r = await client.query(
-    `SELECT column_name FROM information_schema.columns WHERE table_schema=$1 AND table_name=$2`,
-    [schema, table]
-  )
-  return new Set((r.rows||[]).map(x => String(x.column_name).toLowerCase()))
-}
-function coalesceExpr(names, have, castText=true) {
-  const present = names.filter(n => have.has(n.toLowerCase()))
-  if (!present.length) return "NULL"
-  const segs = present.map(n => castText ? `${n}::text` : n)
-  return `COALESCE(${segs.join(",")})`
-}
-
-/* ---------- optional SAM website ---------- */
+/* ========================= SAM helpers ========================= */
 async function fetchVendorWebsiteByUEI(uei, env) {
   const key = env.SAM_API_KEY
   if (!key || !uei) return null
@@ -61,42 +58,90 @@ async function fetchVendorWebsiteByUEI(uei, env) {
     const u = new URL("https://api.sam.gov/entity-information/v2/entities")
     u.searchParams.set("ueiSAM", uei)
     u.searchParams.set("api_key", key)
-    const r = await fetch(u.toString(), { cf:{ cacheTtl:86400, cacheEverything:true } })
+    const r = await fetch(u.toString(), { cf: { cacheTtl: 86400, cacheEverything: true } })
     if (!r.ok) return null
     const j = await r.json()
-    const ent = j?.entityRegistration || j?.entities?.[0] || j?.results?.[0] || null
+    const ent =
+      j?.entityRegistration ||
+      (Array.isArray(j?.entities) ? j.entities[0] : null) ||
+      (Array.isArray(j?.results) ? j.results[0] : null) ||
+      null
     const website =
       ent?.coreData?.businessInformation?.url ||
       ent?.coreData?.generalInformation?.corporateUrl ||
-      ent?.coreData?.generalInformation?.url || null
-    return typeof website === "string" ? website.trim() : null
-  } catch { return null }
+      ent?.coreData?.generalInformation?.url ||
+      null
+    return website && typeof website === "string" ? website.trim() : null
+  } catch {
+    return null
+  }
 }
 
-/* ===================================================================== */
+async function fetchVendorContactsByUEI(uei, env) {
+  const key = env.SAM_API_KEY
+  const out = { website: null, contact: null }
+  if (!key || !uei) return out
+  try {
+    const u = new URL("https://api.sam.gov/entity-information/v2/entities")
+    u.searchParams.set("ueiSAM", uei)
+    u.searchParams.set("api_key", key)
+    const r = await fetch(u.toString(), { cf: { cacheTtl: 86400, cacheEverything: true } })
+    if (!r.ok) return out
+    const j = await r.json()
+    const ent =
+      j?.entityRegistration ||
+      (Array.isArray(j?.entities) ? j.entities[0] : null) ||
+      (Array.isArray(j?.results) ? j.results[0] : null) ||
+      null
+    out.website =
+      ent?.coreData?.businessInformation?.url ||
+      ent?.coreData?.generalInformation?.corporateUrl ||
+      ent?.coreData?.generalInformation?.url ||
+      null
+    const gbp = ent?.pointsOfContact?.governmentBusinessPoc || ent?.pointsOfContact?.electronicBusinessPoc
+    if (gbp) {
+      out.contact = {
+        name: [gbp?.firstName, gbp?.lastName].filter(Boolean).join(" ").trim() || null,
+        email: gbp?.email || null,
+        phone: gbp?.usPhone || gbp?.phone || null,
+      }
+    }
+  } catch {}
+  return out
+}
+
+/* ========================= tiny helpers ========================= */
+const clamp = (v, a = 0, b = 100) => Math.max(a, Math.min(b, v))
+
+/* ========================= Worker ========================= */
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url)
     const origin = request.headers.get("Origin") || ""
     const headers = cors(origin, env)
-    if (request.method === "OPTIONS") return new Response(null, { status:204, headers })
 
-    const segs = url.pathname.split("/").filter(Boolean)
-    const last = segs[segs.length-1] || ""
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers })
+    }
 
-    /* ---------- health ---------- */
+    const segments = url.pathname.split("/").filter(Boolean)
+    const last = segments[segments.length - 1] || ""
+
+    /* ============ Health ============ */
     if (last === "health") {
-      return new Response(JSON.stringify({ ok:true, db:true }), {
-        status:200, headers:{ ...headers, "Content-Type":"application/json" }
+      return new Response(JSON.stringify({ ok: true, db: true }), {
+        status: 200, headers: { ...headers, "Content-Type": "application/json" },
       })
     }
 
-    /* ---------- agencies (cached) ---------- */
+    /* ============ Agencies (same) ============ */
     if (last === "agencies") {
       const cache = caches.default
-      const key = new Request(url.toString(), request)
-      const cached = await cache.match(key)
-      if (cached) return withCors(cached, { ...headers, "Cache-Control":"public, s-maxage=86400, stale-while-revalidate=604800" })
+      const cacheKey = new Request(url.toString(), request)
+      const cached = await cache.match(cacheKey)
+      if (cached) {
+        return withCors(cached, { ...headers, "Cache-Control": "public, s-maxage=86400, stale-while-revalidate=604800" })
+      }
 
       const client = makeClient(env)
       try {
@@ -109,323 +154,338 @@ export default {
           ) x WHERE name IS NOT NULL ORDER BY name LIMIT 400;
         `
         const { rows } = await client.query(sql)
-        const res = new Response(JSON.stringify({ ok:true, rows }), {
-          status:200, headers:{ ...headers, "Content-Type":"application/json",
-            "Cache-Control":"public, s-maxage=86400, stale-while-revalidate=604800" }
+        const res = new Response(JSON.stringify({ ok: true, rows }), {
+          status: 200, headers: { ...headers, "Content-Type": "application/json",
+            "Cache-Control": "public, s-maxage=86400, stale-while-revalidate=604800" },
         })
-        ctx.waitUntil(cache.put(key, res.clone()))
+        ctx.waitUntil(cache.put(cacheKey, res.clone()))
         return res
       } catch (e) {
         try { await client.end() } catch {}
-        return new Response(JSON.stringify({ ok:false, error:e?.message||"query failed" }),
-          { status:500, headers:{ ...headers, "Content-Type":"application/json" }})
+        return new Response(JSON.stringify({ ok: false, error: e?.message || "query failed" }), {
+          status: 500, headers: { ...headers, "Content-Type": "application/json" },
+        })
       } finally { try { await client.end() } catch {} }
     }
 
-    /* ---------- expiring contracts ---------- */
-    if (last === "expiring-contracts") {
-      const naicsParam = (url.searchParams.get("naics")||"").trim()
-      const agencyFilter = (url.searchParams.get("agency")||"").trim()
-      const windowDays = Math.max(1, Math.min(365, parseInt(url.searchParams.get("window_days")||"180",10)))
-      const limit = Math.max(1, Math.min(200, parseInt(url.searchParams.get("limit")||"100",10)))
+    /* ============ /sb/agency-share (unchanged) ============ */
+    if (last === "agency-share") {
+      const fy = parseInt(url.searchParams.get("fy") || "2026", 10)
+      const limit = Math.max(1, Math.min(50, parseInt(url.searchParams.get("limit") || "12", 10)))
+      const client = makeClient(env)
 
-      const naicsList = naicsParam ? naicsParam.split(",").map(s=>s.trim()).filter(Boolean) : []
+      try {
+        await client.connect()
+        const sql = `
+          SELECT agency, sb_share_pct, dollars_total
+          FROM public.sb_agency_share
+          WHERE fiscal_year = $1
+          ORDER BY dollars_total DESC
+          LIMIT $2
+        `
+        const { rows } = await client.query(sql, [fy, limit])
+        ctx.waitUntil(client.end())
+        const data = rows.map(r => ({
+          agency: r.agency,
+          sb_share_pct: typeof r.sb_share_pct === "number" ? r.sb_share_pct : Number(r.sb_share_pct),
+          dollars_total: typeof r.dollars_total === "number" ? r.dollars_total : Number(r.dollars_total),
+        }))
+        return new Response(JSON.stringify({ ok: true, rows: data }), {
+          status: 200, headers: { ...headers, "Content-Type": "application/json" },
+        })
+      } catch (e) {
+        try { await client.end() } catch {}
+        return new Response(JSON.stringify({ ok: false, error: e?.message || "query failed" }), {
+          status: 500, headers: { ...headers, "Content-Type": "application/json" },
+        })
+      }
+    }
+
+    /* ============ /sb/vendor-summary (unchanged) ============ */
+    if (last === "vendor-summary") {
+      const uei = (url.searchParams.get("uei") || "").trim()
+      const agencyFilter = (url.searchParams.get("agency") || "").trim()
+      if (!uei) {
+        return new Response(JSON.stringify({ ok: false, error: "Missing uei parameter." }), {
+          status: 400, headers: { ...headers, "Content-Type": "application/json" },
+        })
+      }
+      const client = makeClient(env)
+      try {
+        await client.connect()
+        const vendorSql = `
+          SELECT recipient_name FROM ${USA_TABLE}
+          WHERE recipient_uei = $1
+          ORDER BY total_dollars_obligated_num DESC NULLS LAST LIMIT 1`
+        const vendorRes = await client.query(vendorSql, [uei])
+        const vendorName = vendorRes.rows[0]?.recipient_name || null
+
+        const summarySql = `
+          SELECT fiscal_year, COUNT(*) AS awards,
+                 SUM(total_dollars_obligated_num) AS obligated,
+                 SUM(potential_total_value_of_award_num) AS ceiling
+          FROM ${USA_TABLE}
+          WHERE recipient_uei = $1 AND (
+            $2::text IS NULL
+            OR awarding_agency_name = $2
+            OR awarding_sub_agency_name = $2
+            OR awarding_office_name = $2
+          )
+          GROUP BY fiscal_year ORDER BY fiscal_year DESC`
+        const summaryRes = await client.query(summarySql, [uei, agencyFilter || null])
+
+        const byYear = (summaryRes.rows || []).map(r => ({
+          fiscalYear: r.fiscal_year,
+          awards: Number(r.awards || 0),
+          obligated: Number(r.obligated || 0),
+          ceiling: Number(r.ceiling || 0),
+        }))
+        const totals = byYear.reduce((a, y) => ({ awards: a.awards + y.awards, obligated: a.obligated + y.obligated, ceiling: a.ceiling + y.ceiling }), { awards: 0, obligated: 0, ceiling: 0 })
+
+        return new Response(JSON.stringify({ ok: true, vendor: { uei, name: vendorName }, agencyFilter: agencyFilter || null, totals, byYear }), {
+          status: 200, headers: { ...headers, "Content-Type": "application/json" },
+        })
+      } catch (e) {
+        try { await client.end() } catch {}
+        return new Response(JSON.stringify({ ok: false, error: e?.message || "query failed" }), {
+          status: 500, headers: { ...headers, "Content-Type": "application/json" },
+        })
+      } finally { try { await client.end() } catch {} }
+    }
+
+    /* ============ /sb/expiring-contracts (unchanged logic) ============ */
+    if (last === "expiring-contracts") {
+      const naicsParam   = (url.searchParams.get("naics") || "").trim()
+      const agencyFilter = (url.searchParams.get("agency") || "").trim()
+      const windowDays   = Math.max(1, Math.min(365, parseInt(url.searchParams.get("window_days") || "180", 10)))
+      const limit        = Math.max(1, Math.min(200, parseInt(url.searchParams.get("limit") || "100", 10)))
+      const naicsList = naicsParam ? naicsParam.split(",").map(s => s.trim()).filter(Boolean) : []
 
       const cache = caches.default
-      const key = new Request(url.toString(), request)
-      const cached = await cache.match(key)
-      if (cached) return withCors(cached, { ...headers, "Cache-Control":"public, s-maxage=300, stale-while-revalidate=86400" })
+      const cacheKey = new Request(url.toString(), request)
+      const cached = await cache.match(cacheKey)
+      if (cached) {
+        return withCors(cached, { ...headers, "Cache-Control": "public, s-maxage=300, stale-while-revalidate=86400" })
+      }
 
       const client = makeClient(env)
       try {
         await client.connect()
-        try { await client.query("SET statement_timeout='55s'") } catch {}
-
+        try { await client.query("SET statement_timeout = '55s'") } catch {}
         const sql = `
           SELECT ${COL.PIID} AS piid, ${COL.AWARD_ID} AS award_key, ${COL.AGENCY} AS agency,
                  ${COL.NAICS} AS naics, ${COL.END_DATE} AS end_date, ${COL.VALUE} AS value
           FROM ${USA_TABLE}
-          WHERE ${COL.END_DATE} >= CURRENT_DATE
-            AND ${COL.END_DATE} < CURRENT_DATE + $1::int
-            AND (
-              $2::text IS NULL OR ${COL.AGENCY}=$2 OR ${COL.SUB_AGENCY}=$2 OR awarding_office_name=$2
-            )
+          WHERE ${COL.END_DATE} >= CURRENT_DATE AND ${COL.END_DATE} < CURRENT_DATE + $1::int
+            AND ($2::text IS NULL OR ${COL.AGENCY}=$2 OR ${COL.SUB_AGENCY}=$2 OR ${COL.OFFICE}=$2)
             AND ($3::text[] IS NULL OR ${COL.NAICS} = ANY($3))
-          ORDER BY ${COL.END_DATE} ASC
-          LIMIT $4
-        `
-        const { rows } = await client.query(sql, [windowDays, agencyFilter || null, naicsList.length ? naicsList : null, limit])
+          ORDER BY ${COL.END_DATE} ASC LIMIT $4`
+        const params = [windowDays, agencyFilter || null, naicsList.length ? naicsList : null, limit]
+        const { rows } = await client.query(sql, params)
+        ctx.waitUntil(client.end())
         const data = rows.map(r => ({
           piid: r.piid, award_key: r.award_key, agency: r.agency,
-          naics: r.naics, end_date: r.end_date,
-          value: typeof r.value === "number" ? r.value : Number(r.value ?? null),
+          naics: r.naics, end_date: r.end_date, value: typeof r.value === "number" ? r.value : Number(r.value ?? null),
         }))
-        const res = new Response(JSON.stringify({ ok:true, rows:data }), {
-          status:200, headers:{ ...headers, "Content-Type":"application/json",
-            "Cache-Control":"public, s-maxage=300, stale-while-revalidate=86400" }
+        const res = new Response(JSON.stringify({ ok: true, rows: data }), {
+          status: 200, headers: { ...headers, "Content-Type": "application/json",
+            "Cache-Control": "public, s-maxage=300, stale-while-revalidate=86400" },
         })
-        ctx.waitUntil(cache.put(key, res.clone()))
+        ctx.waitUntil(cache.put(cacheKey, res.clone()))
         return res
       } catch (e) {
         try { await client.end() } catch {}
-        return new Response(JSON.stringify({ ok:false, error:e?.message||"query failed" }),
-          { status:500, headers:{ ...headers, "Content-Type":"application/json" }})
+        return new Response(JSON.stringify({ ok: false, error: e?.message || "query failed" }), {
+          status: 500, headers: { ...headers, "Content-Type": "application/json" },
+        })
       }
     }
 
-    /* ---------- my-entity ---------- */
-    if (last === "my-entity") {
-      const uei = (url.searchParams.get("uei")||"").trim().toUpperCase()
-      if (!uei) return new Response(JSON.stringify({ ok:false, error:"Missing uei parameter." }),
-        { status:400, headers:{ ...headers, "Content-Type":"application/json" }})
+    /* ============ /sb/vendor-awards (adds title) ============ */
+    if (last === "vendor-awards") {
+      const uei   = (url.searchParams.get("uei") || "").trim()
+      const agency = (url.searchParams.get("agency") || "").trim()
+      const years = Math.max(1, Math.min(10, parseInt(url.searchParams.get("years") || "5", 10)))
+      const limit = Math.max(1, Math.min(300, parseInt(url.searchParams.get("limit") || "100", 10)))
+      if (!uei) {
+        return new Response(JSON.stringify({ ok: false, error: "Missing uei" }), {
+          status: 400, headers: { ...headers, "Content-Type": "application/json" },
+        })
+      }
+
       const client = makeClient(env)
       try {
         await client.connect()
-        const nameRes = await client.query(
-          `SELECT recipient_name FROM ${USA_TABLE}
-           WHERE recipient_uei=$1
-           ORDER BY total_dollars_obligated_num DESC NULLS LAST LIMIT 1`,
-           [uei]
+        try { await client.query("SET statement_timeout = '15000'") } catch {}
+
+        const schema = USA_TABLE.includes(".") ? USA_TABLE.split(".")[0] : "public"
+        const table  = USA_TABLE.includes(".") ? USA_TABLE.split(".")[1] : USA_TABLE
+        const colsRes = await client.query(
+          `SELECT column_name FROM information_schema.columns WHERE table_schema=$1 AND table_name=$2`,
+          [schema, table]
         )
-        const naicsRes = await client.query(
-          `SELECT DISTINCT naics_code FROM ${USA_TABLE}
-           WHERE recipient_uei=$1 AND naics_code IS NOT NULL LIMIT 200`,
-           [uei]
-        )
-        let smallBizCategories = []
-        try {
-          if (env.SAM_PROXY_URL) {
-            const u = `${env.SAM_PROXY_URL.replace(/\/+$/,"")}/entity?uei=${encodeURIComponent(uei)}`
-            const r = await fetch(u)
-            if (r.ok) {
-              const j = await r.json().catch(()=>null)
-              const cats = j?.categories || j?.entity?.socioEconomicCategories || []
-              smallBizCategories = Array.from(new Set((cats||[]).filter(Boolean)))
-            }
-          }
-        } catch {}
-        return new Response(JSON.stringify({
-          ok:true,
-          entity:{
-            uei,
-            name: nameRes.rows[0]?.recipient_name || null,
-            naics: (naicsRes.rows||[]).map(r=>r.naics_code).filter(Boolean),
-            smallBizCategories,
-          }
-        }), { status:200, headers:{ ...headers, "Content-Type":"application/json", "Cache-Control":"public, s-maxage=86400" }})
+        const have = new Set((colsRes.rows || []).map(r => String(r.column_name).toLowerCase()))
+        const has  = (c) => have.has(String(c).toLowerCase())
+
+        const fyExpr =
+          has("fiscal_year") ? "fiscal_year"
+          : has("action_date_fiscal_year") ? "action_date_fiscal_year"
+          : "EXTRACT(YEAR FROM CURRENT_DATE)::int"
+
+        const setAsideExpr = has("type_of_set_aside") ? "type_of_set_aside"
+                          : has("set_aside_any") ? "set_aside_any"
+                          : "NULL::text"
+
+        const vehicleExpr = has("idv_type_of_award") ? "idv_type_of_award"
+                         : has("award_type") ? "award_type"
+                         : "NULL::text"
+
+        const titleExpr = has("title") ? "title" : "NULL::text"
+
+        const sql = `
+          SELECT
+            award_id_piid AS piid,
+            (${fyExpr})   AS fiscal_year,
+            awarding_agency_name AS agency,
+            awarding_sub_agency_name AS sub_agency,
+            awarding_office_name AS office,
+            naics_code AS naics,
+            ${setAsideExpr} AS set_aside,
+            ${vehicleExpr}  AS vehicle,
+            ${titleExpr}    AS title,
+            total_dollars_obligated_num AS obligated
+          FROM ${USA_TABLE}
+          WHERE recipient_uei = $1
+            AND ($2::text IS NULL OR awarding_agency_name=$2 OR awarding_sub_agency_name=$2 OR awarding_office_name=$2)
+            AND (${fyExpr}) >= EXTRACT(YEAR FROM CURRENT_DATE)::int - ($3::int - 1)
+          ORDER BY (${fyExpr}) DESC, award_id_piid DESC
+          LIMIT $4
+        `
+        const { rows } = await client.query(sql, [uei, agency || null, years, limit])
+        ctx.waitUntil(client.end())
+        const data = (rows || []).map(r => ({
+          piid: r.piid, fiscal_year: Number(r.fiscal_year),
+          agency: r.agency, sub_agency: r.sub_agency, office: r.office,
+          naics: r.naics, set_aside: r.set_aside || null, vehicle: r.vehicle || null,
+          title: r.title || null,
+          obligated: typeof r.obligated === "number" ? r.obligated : Number(r.obligated || 0),
+        }))
+        return new Response(JSON.stringify({ ok: true, rows: data }), {
+          status: 200, headers: { ...headers, "Content-Type": "application/json" },
+        })
       } catch (e) {
         try { await client.end() } catch {}
-        return new Response(JSON.stringify({ ok:false, error:e?.message||"query failed" }),
-          { status:500, headers:{ ...headers, "Content-Type":"application/json" }})
-      } finally { try { await client.end() } catch {} }
+        return new Response(JSON.stringify({ ok: false, error: e?.message || "query failed" }), {
+          status: 500, headers: { ...headers, "Content-Type": "application/json" },
+        })
+      }
     }
 
-    /* ---------- vendor-awards (w/ title) ---------- */
-/* =============================================================
- * Vendor awards list (last N fiscal years, filtered by agency)
- *    GET /sb/vendor-awards?uei=XXXX&agency=Dept%20of%20Defense&years=5&limit=100
- * Now returns: piid, fiscal_year, agency/sub/office, naics, set_aside, vehicle,
- *              title, extent_competed, obligated
- * =========================================================== */
-if (last === "vendor-awards") {
-  const uei   = (url.searchParams.get("uei") || "").trim()
-  const agency = (url.searchParams.get("agency") || "").trim()
-  const years = Math.max(1, Math.min(10, parseInt(url.searchParams.get("years") || "5", 10)))
-  const limit = Math.max(1, Math.min(300, parseInt(url.searchParams.get("limit") || "100", 10)))
-
-  if (!uei) {
-    return new Response(JSON.stringify({ ok: false, error: "Missing uei" }), {
-      status: 400, headers: { ...headers, "Content-Type": "application/json" },
-    })
-  }
-
-  const client = makeClient(env)
-  try {
-    await client.connect()
-    try { await client.query("SET statement_timeout = '15000'") } catch {}
-
-    // Column discovery against the view (v2)
-    const schema = USA_TABLE.includes(".") ? USA_TABLE.split(".")[0] : "public"
-    const table  = USA_TABLE.includes(".") ? USA_TABLE.split(".")[1] : USA_TABLE
-    const colsRes = await client.query(
-      `SELECT column_name FROM information_schema.columns
-       WHERE table_schema = $1 AND table_name = $2`,
-      [schema, table]
-    )
-    const have = new Set((colsRes.rows || []).map(r => String(r.column_name).toLowerCase()))
-    const has = (c) => have.has(String(c).toLowerCase())
-
-    // Fiscal-year expression (robust)
-    let fyExpr = null
-    if (has("fiscal_year")) {
-      fyExpr = "fiscal_year"
-    } else if (has("action_date_fiscal_year")) {
-      fyExpr = "action_date_fiscal_year"
-    } else if (has("action_date")) {
-      fyExpr = `CASE WHEN EXTRACT(MONTH FROM action_date)::int >= 10
-                     THEN EXTRACT(YEAR FROM action_date)::int + 1
-                     ELSE EXTRACT(YEAR FROM action_date)::int
-                END`
-    } else if (has("pop_current_end_date")) {
-      fyExpr = `CASE WHEN EXTRACT(MONTH FROM pop_current_end_date)::int >= 10
-                     THEN EXTRACT(YEAR FROM pop_current_end_date)::int + 1
-                     ELSE EXTRACT(YEAR FROM pop_current_end_date)::int
-                END`
-    } else {
-      fyExpr = "EXTRACT(YEAR FROM CURRENT_DATE)::int" // last-resort
-    }
-
-    // Set-aside/vehicle expressions (work across schemas)
-    const setAsideExpr = (() => {
-      const c = ["type_of_set_aside","type_set_aside","set_aside","set_aside_any"].filter(has)
-      return c.length ? `COALESCE(${c.map(n=>`${n}::text`).join(",")})` : "NULL"
-    })()
-
-    const vehicleExpr = (() => {
-      const c = ["idv_type","idv_type_of_award","contract_vehicle","contract_award_type","award_type"].filter(has)
-      return c.length ? `COALESCE(${c.map(n=>`${n}::text`).join(",")})` : "NULL"
-    })()
-
-    // New fields: title + extent_competed (with graceful fallbacks)
-    const titleExpr = (() => {
-      const c = ["title","transaction_description","prime_award_base_transaction_description"].filter(has)
-      return c.length ? `COALESCE(${c.map(n=>`${n}::text`).join(",")})` : "NULL"
-    })()
-
-    const extentExpr = has("extent_competed")
-      ? "extent_competed::text"
-      : (has("extent_competed_code") ? "extent_competed_code::text" : "NULL")
-
-    // Query
-    const sql = `
-      SELECT *
-      FROM (
-        SELECT
-          award_id_piid                                   AS piid,
-          (${fyExpr})                                     AS fiscal_year,
-          awarding_agency_name                            AS agency,
-          awarding_sub_agency_name                        AS sub_agency,
-          awarding_office_name                            AS office,
-          naics_code                                      AS naics,
-          ${setAsideExpr}                                 AS set_aside,
-          ${vehicleExpr}                                  AS vehicle,
-          ${titleExpr}                                    AS title,
-          ${extentExpr}                                   AS extent_competed,
-          total_dollars_obligated_num                     AS obligated,
-          pop_current_end_date                            AS pop_end
-        FROM ${USA_TABLE}
-        WHERE recipient_uei = $1
-          AND (
-            $2::text IS NULL
-            OR awarding_agency_name      = $2
-            OR awarding_sub_agency_name  = $2
-            OR awarding_office_name      = $2
-          )
-      ) q
-      WHERE q.fiscal_year >= EXTRACT(YEAR FROM CURRENT_DATE)::int - ($3::int - 1)
-      ORDER BY q.fiscal_year DESC, q.pop_end DESC NULLS LAST, q.piid DESC
-      LIMIT $4
-    `
-    const params = [uei, agency || null, years, limit]
-    const { rows } = await client.query(sql, params)
-    ctx.waitUntil(client.end())
-
-    const data = (rows || []).map(r => ({
-      piid: r.piid,
-      fiscal_year: Number(r.fiscal_year),
-      agency: r.agency, sub_agency: r.sub_agency, office: r.office,
-      naics: r.naics,
-      set_aside: r.set_aside || null,
-      vehicle: r.vehicle || null,
-      title: r.title || null,
-      extent_competed: r.extent_competed || null,
-      obligated: typeof r.obligated === "number" ? r.obligated : Number(r.obligated || 0),
-    }))
-
-    return new Response(JSON.stringify({ ok: true, rows: data }), {
-      status: 200, headers: { ...headers, "Content-Type": "application/json" },
-    })
-  } catch (e) {
-    try { await client.end() } catch {}
-    return new Response(JSON.stringify({ ok: false, error: e?.message || "query failed" }), {
-      status: 500, headers: { ...headers, "Content-Type": "application/json" },
-    })
-  }
-}
-
-    /* ---------- contract insights (AI) ---------- */
+    /* ============ /sb/contracts/insights (adds quick facts) ============ */
     if (request.method === "POST" && url.pathname.toLowerCase().endsWith("/contracts/insights")) {
       if (!env.OPENAI_API_KEY) {
-        return new Response(JSON.stringify({ ok:false, error:"OPENAI_API_KEY is not configured for sb-analytics." }),
-          { status:500, headers:{ ...headers, "Content-Type":"application/json" }})
+        return new Response(JSON.stringify({ ok: false, error: "OPENAI_API_KEY is not configured for sb-analytics." }), {
+          status: 500, headers: { ...headers, "Content-Type": "application/json" },
+        })
       }
+      const body = await request.json().catch(() => ({}))
+      const piid = String(body.piid || "").trim().toUpperCase()
+      if (!piid) {
+        return new Response(JSON.stringify({ ok: false, error: "Missing piid" }), {
+          status: 400, headers: { ...headers, "Content-Type": "application/json" },
+        })
+      }
+
       const client = makeClient(env)
       try {
-        const body = await request.json().catch(()=> ({}))
-        const piid = String(body.piid || "").trim().toUpperCase()
-        if (!piid) return new Response(JSON.stringify({ ok:false, error:"Missing piid" }),
-          { status:400, headers:{ ...headers, "Content-Type":"application/json" }})
         await client.connect()
 
         const awardSql = `
-          SELECT award_id_piid, awarding_agency_name, awarding_sub_agency_name, awarding_office_name,
-                 recipient_name, recipient_uei, naics_code, naics_description,
-                 pop_start_date, pop_current_end_date, pop_potential_end_date,
-                 current_total_value_of_award_num, potential_total_value_of_award_num, total_dollars_obligated_num
-          FROM ${USA_TABLE} WHERE award_id_piid=$1
-          ORDER BY pop_current_end_date DESC LIMIT 1
+          SELECT
+            award_id_piid,
+            awarding_agency_name, awarding_sub_agency_name, awarding_office_name,
+            recipient_name, recipient_uei,
+            recipient_doing_business_as_name, cage_code,
+            naics_code, naics_description,
+            period_of_performance_start_date AS pop_start_date,
+            ${COL.END_DATE} AS pop_current_end_date,
+            pop_potential_end_date,
+            current_total_value_of_award_num,
+            potential_total_value_of_award_num,
+            total_dollars_obligated_num,
+            COALESCE(title, transaction_description) AS title,
+            extent_competed,
+            type_of_set_aside,
+            number_of_offers_received
+          FROM ${USA_TABLE}
+          WHERE award_id_piid = $1
+          ORDER BY ${COL.END_DATE} DESC NULLS LAST
+          LIMIT 1
         `
-        const aRes = await client.query(awardSql, [piid])
-        if (!aRes.rows.length) {
-          return new Response(JSON.stringify({ ok:false, error:"No award found for that PIID." }),
-            { status:404, headers:{ ...headers, "Content-Type":"application/json" }})
+        const awardRes = await client.query(awardSql, [piid])
+        if (!awardRes.rows.length) {
+          return new Response(JSON.stringify({ ok: false, error: "No award found for that PIID." }), {
+            status: 404, headers: { ...headers, "Content-Type": "application/json" },
+          })
         }
-        const a = aRes.rows[0]
-        const toNum = (x)=> typeof x==="number" ? x : (x==null? null : Number(x))
-        const obligated = toNum(a.total_dollars_obligated_num) ?? 0
-        const currentValue =
-          toNum(a.current_total_value_of_award_num) ??
-          toNum(a.potential_total_value_of_award_num) ?? 0
-        const ceiling = toNum(a.potential_total_value_of_award_num) ?? currentValue
+        const a = awardRes.rows[0]
+        const toNumber = (x) => (typeof x === "number" ? x : x == null ? null : Number(x))
+        const obligated = toNumber(a.total_dollars_obligated_num) ?? 0
+        const currentValue = toNumber(a.current_total_value_of_award_num) ?? toNumber(a.potential_total_value_of_award_num) ?? 0
+        const ceiling = toNumber(a.potential_total_value_of_award_num) ?? currentValue
 
+        const startDate = a.pop_start_date ? new Date(a.pop_start_date) : null
+        const currentEnd = a.pop_current_end_date ? new Date(a.pop_current_end_date) : null
+        const potentialEnd = a.pop_potential_end_date ? new Date(a.pop_potential_end_date) : null
+        const endForLifecycle = potentialEnd || currentEnd
         const today = new Date()
-        const sd = a.pop_start_date ? new Date(a.pop_start_date) : null
-        const cend = a.pop_current_end_date ? new Date(a.pop_current_end_date) : null
-        const pend = a.pop_potential_end_date ? new Date(a.pop_potential_end_date) : null
-        const end = pend || cend
-        let stage = "unknown", label="Lifecycle insight limited", windowLabel="Window unknown", timePct=null, burnPct=null
-        if (sd && end && end>sd) {
-          const total = end.getTime()-sd.getTime()
-          const elapsed = Math.min(Math.max(today.getTime(), sd.getTime()), end.getTime()) - sd.getTime()
-          timePct = Math.round((elapsed/total)*100)
-          if (today<sd) { stage="not_started"; label="Not started yet"; windowLabel="Window not opened" }
-          else if (today>end) { stage="complete"; label="Performance complete"; windowLabel="Window passed" }
-          else if (timePct<25) { stage="early"; label="Early stage"; windowLabel="In performance window" }
-          else if (timePct<75) { stage="mid"; label="Mid-stage"; windowLabel="In performance window" }
-          else { stage="late"; label="Late / near end"; windowLabel="In performance window" }
-        }
-        if (ceiling && ceiling>0) burnPct = Math.round((obligated/ceiling)*100)
 
-        const subsRes = await client.query(
-          `SELECT subawardee_name, subawardee_uei, subaward_amount
-           FROM public.usaspending_contract_subawards WHERE prime_award_piid=$1`, [piid]
-        )
+        let lifecycleStage = "unknown", lifecycleLabel = "Lifecycle insight limited", windowLabel = "Window unknown", timeElapsedPct = null
+        if (startDate && endForLifecycle && endForLifecycle > startDate) {
+          const totalMs = endForLifecycle.getTime() - startDate.getTime()
+          const clampedNow = Math.min(Math.max(today.getTime(), startDate.getTime()), endForLifecycle.getTime())
+          const elapsedMs = clampedNow - startDate.getTime()
+          timeElapsedPct = Math.round((elapsedMs / totalMs) * 100)
+          if (today < startDate) { lifecycleStage = "not_started"; lifecycleLabel = "Not started yet"; windowLabel = "Window not opened" }
+          else if (today > endForLifecycle) { lifecycleStage = "complete"; lifecycleLabel = "Performance complete"; windowLabel = "Window passed" }
+          else if (timeElapsedPct < 25) { lifecycleStage = "early"; lifecycleLabel = "Early stage"; windowLabel = "In performance window" }
+          else if (timeElapsedPct < 75) { lifecycleStage = "mid"; lifecycleLabel = "Mid-stage"; windowLabel = "In performance window" }
+          else { lifecycleStage = "late"; lifecycleLabel = "Late / near end"; windowLabel = "In performance window" }
+        }
+        const burnPct = ceiling && ceiling > 0 ? Math.round((obligated / ceiling) * 100) : null
+
+        // subs (unchanged)
+        const subsSql = `
+          SELECT subawardee_name, subawardee_uei, subaward_amount
+          FROM public.usaspending_contract_subawards
+          WHERE prime_award_piid = $1
+        `
+        const subsRes = await client.query(subsSql, [piid])
         const subsRaw = subsRes.rows || []
         const subMap = new Map()
         for (const row of subsRaw) {
           const name = row.subawardee_name || "(Unnamed subrecipient)"
           const uei = row.subawardee_uei || null
-          const amt = toNum(row.subaward_amount) || 0
+          const amt = toNumber(row.subaward_amount) || 0
           const key = `${uei || "NOUEI"}|${name}`
-          const prev = subMap.get(key) || { name, uei, amount:0 }
+          const prev = subMap.get(key) || { name, uei, amount: 0 }
           prev.amount += amt
           subMap.set(key, prev)
         }
-        const subsAgg = Array.from(subMap.values()).sort((a,b)=> (b.amount||0)-(a.amount||0))
+        const subsAgg = Array.from(subMap.values()).sort((a, b) => (b.amount || 0) - (a.amount || 0))
         const subCount = subsRaw.length
         const distinctRecipients = subsAgg.length
-        const totalSubAmount = subsAgg.reduce((s,x)=> s+(x.amount||0), 0)
-        const topSubs = subsAgg.slice(0,5)
+        const totalSubAmount = subsAgg.reduce((s, x) => s + (x.amount || 0), 0)
+        const topSubs = subsAgg.slice(0, 5)
+
+        let primeVsSubsPct = null, largestSubPct = null
+        if (obligated > 0 && totalSubAmount > 0) {
+          const subPct = Math.min(100, (totalSubAmount / obligated) * 100)
+          primeVsSubsPct = { prime: Math.round(100 - subPct), subs: Math.round(subPct) }
+        }
+        if (totalSubAmount > 0 && topSubs.length > 0) {
+          largestSubPct = Math.round((topSubs[0].amount / totalSubAmount) * 100)
+        }
 
         const primary = {
           piid: a.award_id_piid,
@@ -434,6 +494,12 @@ if (last === "vendor-awards") {
           office: a.awarding_office_name || null,
           primeName: a.recipient_name || null,
           primeUei: a.recipient_uei || null,
+          dbaName: a.recipient_doing_business_as_name || null,
+          cageCode: a.cage_code || null,
+          title: a.title || null,
+          extentCompeted: a.extent_competed || null,
+          setAside: a.type_of_set_aside || null,
+          offersReceived: a.number_of_offers_received || null,
           naicsCode: a.naics_code || null,
           naicsDescription: a.naics_description || null,
           popStartDate: a.pop_start_date || null,
@@ -445,177 +511,204 @@ if (last === "vendor-awards") {
         if (website) primary.website = website
 
         const lifecycle = {
-          stage, label, windowLabel, timeElapsedPct: timePct, burnPct,
-          primeVsSubsPct: (obligated>0 && totalSubAmount>0)
-            ? { prime: Math.round(100 - Math.min(100,(totalSubAmount/obligated)*100)), subs: Math.round(Math.min(100,(totalSubAmount/obligated)*100)) }
-            : null,
-          largestSubPct: (totalSubAmount>0 && topSubs.length>0) ? Math.round((topSubs[0].amount/totalSubAmount)*100) : null,
+          stage: lifecycleStage, label: lifecycleLabel, windowLabel, timeElapsedPct, burnPct, primeVsSubsPct, largestSubPct,
         }
         const subs = { count: subCount, distinctRecipients, totalAmount: totalSubAmount, top: topSubs }
 
-        const burnText = burnPct==null
-          ? "Burn vs. ceiling could not be determined."
-          : `Approximately ${burnPct}% of ceiling is obligated (≈$${Math.round(obligated).toLocaleString()} of ≈$${Math.round(ceiling).toLocaleString()}).`
-        const subsText = subCount===0
-          ? "No subcontract awards are publicly reported for this contract."
-          : `There are ${subCount} reported subawards to ${distinctRecipients} recipients, totaling about $${Math.round(totalSubAmount).toLocaleString()}.`
-
+        // Concise AI summary (we’ll keep it short)
+        const burnText =
+          burnPct == null
+            ? "Burn vs. ceiling is unknown."
+            : `~${burnPct}% of the ceiling is obligated.`
         const prompt = `
-You are helping a small federal contractor interpret a contract snapshot and what to do next.
-Use the given numbers as ground truth.
-
-PIID: ${primary.piid}
-Agency: ${primary.agency || "—"} / ${primary.subAgency || "—"} / ${primary.office || "—"}
-Prime: ${primary.primeName || "—"} (UEI ${primary.primeUei || "unknown"})${website ? ` — ${website}` : ""}
-NAICS: ${primary.naicsCode || "—"} — ${primary.naicsDescription || "—"}
-PoP: ${primary.popStartDate || "—"} → ${primary.popCurrentEndDate || "—"} (potential: ${primary.popPotentialEndDate || "—"})
-Lifecycle: ${lifecycle.stage} (${lifecycle.label}) time≈${lifecycle.timeElapsedPct ?? "?"}%
-${burnText}
-Subs: ${subsText}
-
-Write 4–6 crisp bullets on capture timing and actionable next steps. 170 words max.
-        `.trim()
+Summarize actionable insights (4–6 bullets) for PIID ${primary.piid}.
+Include lifecycle (${lifecycle.label}), ${burnText}, subcontracting footprint (${subs.count} subs, ${distinctRecipients} distinct), and one line on teaming angle.
+Max 160 words.`.trim()
 
         const aiRes = await fetch("https://api.openai.com/v1/chat/completions", {
-          method:"POST",
-          headers:{ "Content-Type":"application/json", Authorization:`Bearer ${env.OPENAI_API_KEY}` },
-          body: JSON.stringify({ model:"gpt-4.1-mini", messages:[
-            { role:"system", content:"You are a federal contracts analyst." },
-            { role:"user", content: prompt }
-          ], max_tokens:400 })
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${env.OPENAI_API_KEY}` },
+          body: JSON.stringify({
+            model: "gpt-4.1-mini",
+            messages: [
+              { role: "system", content: "You are a federal contracts analyst." },
+              { role: "user", content: prompt },
+            ],
+            max_tokens: 350,
+            temperature: 0.3,
+          }),
         })
         const aiText = await aiRes.text()
         let aiJson = {}
-        try { aiJson = aiText ? JSON.parse(aiText) : {} } catch { throw new Error("AI response not JSON: "+aiText.slice(0,160)) }
-        const summary = aiJson.choices?.[0]?.message?.content?.trim() || "AI produced no summary."
+        try { aiJson = aiText ? JSON.parse(aiText) : {} } catch { aiJson = {} }
+        const summary = aiJson?.choices?.[0]?.message?.content?.trim() || "—"
 
         return new Response(JSON.stringify({
-          ok:true, summary, primary, lifecycle, subs,
-          disclaimer: "Subcontractor data is sourced from USAspending and may be incomplete."
-        }), { status:200, headers:{ ...headers, "Content-Type":"application/json" }})
+          ok: true, summary, primary, lifecycle, subs,
+          disclaimer:
+            "Subcontractor data is from USAspending. Primes are not required to report every subcontract, so this list may be incomplete.",
+        }), {
+          status: 200, headers: { ...headers, "Content-Type": "application/json" },
+        })
       } catch (e) {
-        return new Response(JSON.stringify({ ok:false, error:e?.message||"AI insight failed" }),
-          { status:500, headers:{ ...headers, "Content-Type":"application/json" }})
-      }
+        return new Response(JSON.stringify({ ok: false, error: e?.message || "AI insight failed" }), {
+          status: 500, headers: { ...headers, "Content-Type": "application/json" },
+        })
+      } finally { try { await client.end() } catch {} }
     }
 
-    /* ---------- bid/no-bid (auto-scorer) ---------- */
+    /* ============ /sb/my-entity (unchanged) ============ */
+    if (last === "my-entity") {
+      const uei = (url.searchParams.get("uei") || "").trim().toUpperCase()
+      if (!uei) {
+        return new Response(JSON.stringify({ ok:false, error:"Missing uei parameter." }), {
+          status:400, headers:{ ...headers, "Content-Type":"application/json" }
+        })
+      }
+      const client = makeClient(env)
+      try {
+        await client.connect()
+        const nameRes = await client.query(
+          `SELECT recipient_name FROM ${USA_TABLE}
+           WHERE recipient_uei=$1 ORDER BY total_dollars_obligated_num DESC NULLS LAST LIMIT 1`, [uei])
+        const name = nameRes.rows[0]?.recipient_name || null
+
+        const naicsRes = await client.query(
+          `SELECT DISTINCT naics_code FROM ${USA_TABLE}
+           WHERE recipient_uei=$1 AND naics_code IS NOT NULL LIMIT 200`, [uei])
+        const naics = (naicsRes.rows || []).map(r => r.naics_code).filter(Boolean)
+
+        let smallBizCategories = []
+        try {
+          if (env.SAM_PROXY_URL) {
+            const samUrl = `${env.SAM_PROXY_URL.replace(/\/+$/, "")}/entity?uei=${encodeURIComponent(uei)}`
+            const samRes = await fetch(samUrl)
+            if (samRes.ok) {
+              const samJson = await samRes.json().catch(() => null)
+              const cats =
+                (Array.isArray(samJson?.categories) && samJson.categories) ||
+                (samJson?.entity?.socioEconomicCategories || [])
+              smallBizCategories = Array.from(new Set((cats || []).filter(Boolean)))
+            }
+          }
+        } catch {}
+
+        return new Response(JSON.stringify({ ok: true, entity: { uei, name, naics, smallBizCategories } }), {
+          status: 200, headers: { ...headers, "Content-Type":"application/json", "Cache-Control":"public, s-maxage=86400" },
+        })
+      } catch (e) {
+        try { await client.end() } catch {}
+        return new Response(JSON.stringify({ ok:false, error:e?.message || "query failed" }), {
+          status:500, headers:{ ...headers, "Content-Type":"application/json" }
+        })
+      } finally { try { await client.end() } catch {} }
+    }
+
+    /* ============ /sb/bid-nobid (fixed for v2) ============ */
     if (last === "bid-nobid") {
-      const piid = (url.searchParams.get("piid")||"").trim().toUpperCase()
-      const uei  = (url.searchParams.get("uei") ||"").trim().toUpperCase()
-      const years = Math.max(1, Math.min(10, parseInt(url.searchParams.get("years")||"5",10)))
-      if (!piid || !uei) return new Response(JSON.stringify({ ok:false, error:"Missing piid or uei" }),
-        { status:400, headers:{ ...headers, "Content-Type":"application/json" }})
+      const piid = (url.searchParams.get("piid") || "").trim().toUpperCase()
+      const uei  = (url.searchParams.get("uei")  || "").trim().toUpperCase()
+      const years = Math.max(1, Math.min(10, parseInt(url.searchParams.get("years") || "5", 10)))
+      if (!piid || !uei) {
+        return new Response(JSON.stringify({ ok:false, error:"Missing piid or uei" }),
+          { status:400, headers:{ ...headers, "Content-Type":"application/json" }})
+      }
 
       const client = makeClient(env)
       try {
         await client.connect()
-        const have = await getColumns(client, USA_TABLE)
+        const schema = USA_TABLE.includes(".") ? USA_TABLE.split(".")[0] : "public"
+        const table  = USA_TABLE.includes(".") ? USA_TABLE.split(".")[1] : USA_TABLE
+        const cols = await client.query(
+          `SELECT column_name FROM information_schema.columns WHERE table_schema=$1 AND table_name=$2`,
+          [schema, table]
+        )
+        const have = new Set((cols.rows||[]).map(r=>String(r.column_name).toLowerCase()))
+        const has  = (c) => have.has(c.toLowerCase())
+        const fyExpr = has("fiscal_year") ? "fiscal_year"
+          : has("action_date_fiscal_year") ? "action_date_fiscal_year"
+          : "EXTRACT(YEAR FROM CURRENT_DATE)::int"
 
-        // FY expression
-        let fyExpr = "EXTRACT(YEAR FROM CURRENT_DATE)::int"
-        if (have.has("fiscal_year")) fyExpr = "fiscal_year"
-        else if (have.has("action_date_fiscal_year")) fyExpr = "action_date_fiscal_year"
-        else if (have.has("action_date")) {
-          fyExpr = `CASE WHEN EXTRACT(MONTH FROM action_date)::int>=10
-                    THEN EXTRACT(YEAR FROM action_date)::int+1 ELSE EXTRACT(YEAR FROM action_date)::int END`
-        } else if (have.has("pop_current_end_date")) {
-          fyExpr = `CASE WHEN EXTRACT(MONTH FROM pop_current_end_date)::int>=10
-                    THEN EXTRACT(YEAR FROM pop_current_end_date)::int+1 ELSE EXTRACT(YEAR FROM pop_current_end_date)::int END`
-        }
-
-        // award snapshot
-        const aRes = await client.query(`
+        const award = await client.query(`
           SELECT award_id_piid, naics_code, naics_description,
                  awarding_agency_name, awarding_sub_agency_name, awarding_office_name,
                  recipient_uei, recipient_name,
                  total_dollars_obligated_num AS obligated,
                  potential_total_value_of_award_num AS ceiling,
-                 pop_current_end_date
+                 ${COL.END_DATE} AS pop_current_end_date
           FROM ${USA_TABLE}
-          WHERE award_id_piid=$1
-          ORDER BY pop_current_end_date DESC NULLS LAST
-          LIMIT 1`, [piid])
-        if (!aRes.rows.length) {
+          WHERE award_id_piid = $1
+          ORDER BY ${COL.END_DATE} DESC NULLS LAST LIMIT 1`, [piid])
+        if (!award.rows.length) {
           return new Response(JSON.stringify({ ok:false, error:"PIID not found" }),
             { status:404, headers:{ ...headers, "Content-Type":"application/json" }})
         }
-        const A = aRes.rows[0]
+        const A = award.rows[0]
         const orgName = A.awarding_sub_agency_name || A.awarding_office_name || A.awarding_agency_name
         const naics = A.naics_code
 
-        // my-entity NAICS/socio
+        // my entity (for NAICS/socio)
         const entRes = await fetch(`${url.origin}/sb/my-entity?uei=${encodeURIComponent(uei)}`)
-        const entJson = await entRes.json().catch(()=> ({}))
-        const myNAICS = (entJson?.entity?.naics || []).filter(Boolean)
-        const mySocio = (entJson?.entity?.smallBizCategories || entJson?.entity?.socio || []).filter(Boolean)
+        const ent = await entRes.json().catch(()=>({}))
+        const myNAICS = (ent?.entity?.naics || []).filter(Boolean)
+        const mySocio = (ent?.entity?.smallBizCategories || []).filter(Boolean)
 
-        // my awards
-        const myRes = await client.query(`
+        // my awards at org
+        const myAwards = await client.query(`
           SELECT COUNT(*)::int AS cnt, COALESCE(SUM(total_dollars_obligated_num),0)::float8 AS obligated
           FROM ${USA_TABLE}
-          WHERE recipient_uei=$1
-            AND ($2::text IS NULL OR awarding_agency_name=$2 OR awarding_sub_agency_name=$2 OR awarding_office_name=$2)
+          WHERE recipient_uei=$1 AND ($2::text IS NULL OR awarding_agency_name=$2 OR awarding_sub_agency_name=$2 OR awarding_office_name=$2)
             AND (${fyExpr}) >= EXTRACT(YEAR FROM CURRENT_DATE)::int - ($3::int - 1)
         `,[uei, orgName, years])
 
-        // incumbent awards at org
-        const incRes = await client.query(`
+        // incumbent strength
+        const inc = await client.query(`
           SELECT COUNT(*)::int AS cnt, COALESCE(SUM(total_dollars_obligated_num),0)::float8 AS obligated
           FROM ${USA_TABLE}
-          WHERE recipient_uei=$1
-            AND ($2::text IS NULL OR awarding_agency_name=$2 OR awarding_sub_agency_name=$2 OR awarding_office_name=$2)
+          WHERE recipient_uei=$1 AND ($2::text IS NULL OR awarding_agency_name=$2 OR awarding_sub_agency_name=$2 OR awarding_office_name=$2)
             AND (${fyExpr}) >= EXTRACT(YEAR FROM CURRENT_DATE)::int - ($3::int - 1)
         `,[A.recipient_uei, orgName, years])
 
-        // market distribution for NAICS@org
-        const distRes = await client.query(`
+        // price percentiles by NAICS@org
+        const dist = await client.query(`
           WITH base AS (
             SELECT total_dollars_obligated_num AS obligated
             FROM ${USA_TABLE}
-            WHERE naics_code=$1
-              AND ($2::text IS NULL OR awarding_agency_name=$2 OR awarding_sub_agency_name=$2 OR awarding_office_name=$2)
+            WHERE naics_code=$1 AND ($2::text IS NULL OR awarding_agency_name=$2 OR awarding_sub_agency_name=$2 OR awarding_office_name=$2)
               AND (${fyExpr}) >= EXTRACT(YEAR FROM CURRENT_DATE)::int - ($3::int - 1)
               AND total_dollars_obligated_num IS NOT NULL
           )
-          SELECT
-            percentile_cont(0.25) WITHIN GROUP (ORDER BY obligated)::float8 AS p25,
-            percentile_cont(0.50) WITHIN GROUP (ORDER BY obligated)::float8 AS p50,
-            percentile_cont(0.75) WITHIN GROUP (ORDER BY obligated)::float8 AS p75
-          FROM base
-        `,[naics, orgName, years])
-        const P = distRes.rows[0] || { p25:null, p50:null, p75:null }
+          SELECT percentile_cont(0.25) WITHIN GROUP (ORDER BY obligated)::float8 AS p25,
+                 percentile_cont(0.50) WITHIN GROUP (ORDER BY obligated)::float8 AS p50,
+                 percentile_cont(0.75) WITHIN GROUP (ORDER BY obligated)::float8 AS p75
+          FROM base`, [naics, orgName, years])
+        const P = dist.rows[0] || { p25:null, p50:null, p75:null }
 
-        // set-aside tendency (SAFE!)
-        const setAsideExpr = coalesceExpr(["type_of_set_aside","type_set_aside","set_aside"], have, true)
-        const saRes = await client.query(`
-          SELECT COUNT(*) FILTER (WHERE ${setAsideExpr} IS NOT NULL)::int AS known,
+        // set-aside tendency
+        const setAside = await client.query(`
+          SELECT COUNT(*) FILTER (WHERE type_of_set_aside IS NOT NULL)::int AS known,
                  COUNT(*)::int AS total,
-                 MAX(${setAsideExpr}) AS example_set_aside
+                 MAX(type_of_set_aside) AS example_set_aside
           FROM ${USA_TABLE}
-          WHERE naics_code=$1
-            AND ($2::text IS NULL OR awarding_agency_name=$2 OR awarding_sub_agency_name=$2 OR awarding_office_name=$2)
+          WHERE naics_code=$1 AND ($2::text IS NULL OR awarding_agency_name=$2 OR awarding_sub_agency_name=$2 OR awarding_office_name=$2)
             AND (${fyExpr}) >= EXTRACT(YEAR FROM CURRENT_DATE)::int - ($3::int - 1)
         `,[naics, orgName, years])
 
         // scoring
-        const toNum = (x)=> typeof x==="number" ? x : Number(x||0)
-        const meCnt = toNum(myRes.rows[0]?.cnt), meObl = toNum(myRes.rows[0]?.obligated)
-        const incCnt = toNum(incRes.rows[0]?.cnt), incObl = toNum(incRes.rows[0]?.obligated)
+        const toNum = x => typeof x === "number" ? x : x==null ? 0 : Number(x)||0
+        const meCnt = toNum(myAwards.rows[0]?.cnt), meObl = toNum(myAwards.rows[0]?.obligated)
+        const incCnt = toNum(inc.rows[0]?.cnt), incObl = toNum(inc.rows[0]?.obligated)
         const today = new Date()
         const dEnd = A.pop_current_end_date ? new Date(A.pop_current_end_date) : null
         const daysToEnd = dEnd ? Math.round((dEnd.getTime() - today.getTime())/86400000) : null
-        const burn = A.ceiling && A.ceiling>0 ? Math.round((toNum(A.obligated)/toNum(A.ceiling))*100) : null
+        const burn = A.ceiling && A.ceiling>0 ? Math.round((toNum(A.obligated||0)/toNum(A.ceiling||0))*100) : null
 
-        const tech =
-          myNAICS.includes(naics) ? 5 :
-          myNAICS.some(c=> (c||"").slice(0,3) === String(naics||"").slice(0,3)) ? 4 : 2
-
-        const pp = (meCnt>=3 || meObl>=2_000_000) ? 5 : (meCnt>=1 ? 3 : 1)
+        const tech = myNAICS.includes(naics) ? 5 : myNAICS.some(c=> c?.slice(0,3)===String(naics).slice(0,3)) ? 4 : 2
+        const pp = meCnt>=3 || meObl>=2_000_000 ? 5 : meCnt>=1 ? 3 : 1
 
         let staffing = 3
         if (P.p50) {
-          const contractSize = toNum(A.obligated || A.ceiling || 0)
+          const contractSize = toNum(A.obligated||A.ceiling||0)
           staffing = contractSize <= P.p50 ? 5 : (contractSize <= (P.p75||P.p50) ? 4 : 2)
         }
 
@@ -623,64 +716,67 @@ Write 4–6 crisp bullets on capture timing and actionable next steps. 170 words
         if (daysToEnd!=null && burn!=null) {
           if (daysToEnd>180 && burn<70) sched=5
           else if (daysToEnd<60 || burn>90) sched=2
+          else sched=3
         }
 
-        const knownSA = toNum(saRes.rows[0]?.known)
-        const example = (saRes.rows[0]?.example_set_aside || "").toUpperCase()
-        const haveMatch = (tag)=> mySocio.some(s=> (s||"").toUpperCase().includes(tag))
-        let comp = 3
+        const knownSA = toNum(setAside.rows[0]?.known)
+        const example = (setAside.rows[0]?.example_set_aside||"").toUpperCase()
+        const haveMatch = tag => mySocio.some(s=> s.toUpperCase().includes(tag))
+        let compScore = 3
         if (knownSA>0) {
-          if ((example.includes("SDVOSB") && haveMatch("SDVOSB")) ||
-              (example.includes("WOSB")  && haveMatch("WOSB"))  ||
-              (example.includes("HUB")   && haveMatch("HUB"))   ||
-              (example.includes("8(A)")  && (haveMatch("8(A)") || haveMatch("8A")))) comp = 5
-          else comp = 2
+          if (example.includes("SDVOSB") && haveMatch("SDVOSB")) compScore=5
+          else if (example.includes("WOSB") && haveMatch("WOSB")) compScore=5
+          else if (example.includes("HUB") && haveMatch("HUB")) compScore=5
+          else if (example.includes("8(A)") && (haveMatch("8(A)")||haveMatch("8A"))) compScore=5
+          else compScore=2
         }
 
         let price = 3
         if (P.p25 && P.p50 && P.p75) {
-          const val = toNum(A.obligated || A.ceiling || 0)
+          const val = toNum(A.obligated||A.ceiling||0)
           if (val<=P.p25) price=4
           else if (val<=P.p50) price=5
           else if (val<=P.p75) price=3
           else price=2
         }
-
         const intimacy = meCnt>=3 ? 5 : meCnt===2 ? 4 : meCnt===1 ? 3 : 1
         const compIntel = incCnt===0 ? 5 : incCnt<=2 ? 4 : incCnt<=5 ? 3 : 2
 
         const W = { tech:24, pp:20, staff:12, sched:8, compliance:8, price:8, intimacy:10, intel:10 }
         const weighted = Math.round((
           W.tech*(tech/5) + W.pp*(pp/5) + W.staff*(staffing/5) + W.sched*(sched/5) +
-          W.compliance*(comp/5) + W.price*(price/5) + W.intimacy*(intimacy/5) + W.intel*(compIntel/5)
-        ) * 100) / 100
+          W.compliance*(compScore/5) + W.price*(price/5) + W.intimacy*(intimacy/5) + W.intel*(compIntel/5)
+        )*10)/10
         const decision = weighted>=80 ? "bid" : (weighted>=65 ? "conditional" : "no_bid")
 
         const heat = [
-          { level: incCnt>5 ? "High":"Med-High", reason:`Incumbent has ${incCnt} awards / $${Math.round(incObl).toLocaleString()} at ${orgName}` },
+          { level: incCnt>5 ? "High":"Med-High", reason: `Incumbent has ${incCnt} awards / $${Math.round(incObl).toLocaleString()} at ${orgName}` },
           { level: myNAICS.includes(naics) ? "Low":"Med-High", reason: myNAICS.includes(naics) ? "Exact NAICS match" : "No exact NAICS in SAM" },
           { level: meCnt>0 ? "Medium":"High", reason: meCnt>0 ? `You have ${meCnt} awards at this org` : "No awards at this org" },
         ]
         const improve = []
-        if (!myNAICS.includes(naics)) improve.push(`Add NAICS ${naics} in SAM or team with a holder.`)
-        if (meCnt===0) improve.push(`Pursue micro-tasking/teaming at ${orgName} to build a reference.`)
-        if (knownSA>0 && comp<5) improve.push(`Align socio-economic status to prior set-aside pattern (${example || "varied"}).`)
+        if (!myNAICS.includes(naics)) improve.push(`Add NAICS ${naics} to SAM (or team with a prime holding it).`)
+        if (meCnt===0) improve.push(`Pursue micro-tasking/teaming at ${orgName} to build a reference quickly.`)
+        if (knownSA>0 && compScore<5) improve.push(`Align socio category with prior set-aside pattern (${example || "varied"}).`)
+        if ((P.p50||0)>0 && (toNum(A.obligated||A.ceiling||0)>(P.p75||P.p50))) improve.push("Propose lean staffing/price to sit below local median.")
 
         return new Response(JSON.stringify({
           ok:true,
           inputs:{ piid, uei, org:orgName, naics },
           criteria:[
-            { name:"Technical Fit", weight:24, score:tech, reason: myNAICS.includes(naics) ? "Exact NAICS match" : (myNAICS.some(c=> (c||"").slice(0,3)===String(naics||"").slice(0,3)) ? "Related NAICS family" : "No NAICS match") },
+            { name:"Technical Fit", weight:24, score:tech, reason: myNAICS.includes(naics) ? "Exact NAICS match" : myNAICS.some(c=>c?.slice(0,3)===String(naics).slice(0,3)) ? "Related NAICS family" : "No NAICS match" },
             { name:"Relevant Experience / Past Performance", weight:20, score:pp, reason:`Your awards at this org: ${meCnt}; $${Math.round(meObl).toLocaleString()}` },
             { name:"Staffing & Key Personnel", weight:12, score:staffing, reason:"Proxy via local award size distribution" },
             { name:"Schedule / ATO Timeline Risk", weight:8, score:sched, reason:`Days to end: ${daysToEnd ?? "unknown"}; burn: ${burn ?? "unknown"}%` },
-            { name:"Compliance", weight:8, score:comp, reason: knownSA ? `Historic set-aside example: ${example||"—"}` : "Set-aside pattern unknown" },
+            { name:"Compliance", weight:8, score:compScore, reason: knownSA? `Historic set-aside pattern: ${example||"varied"}`:"Set-aside unknown" },
             { name:"Price Competitiveness", weight:8, score:price, reason:"Position vs NAICS@org percentiles" },
             { name:"Customer Intimacy", weight:10, score:intimacy, reason:`Your awards at this org: ${meCnt}` },
             { name:"Competitive Intelligence", weight:10, score:compIntel, reason:`Incumbent awards: ${incCnt}` },
           ],
           weighted_percent: weighted,
-          decision, heatmap: heat, improve_now: improve
+          decision,
+          heatmap: heat,
+          improve_now: improve
         }), { status:200, headers:{ ...headers, "Content-Type":"application/json" }})
       } catch (e) {
         try { await client.end() } catch {}
@@ -689,65 +785,195 @@ Write 4–6 crisp bullets on capture timing and actionable next steps. 170 words
       } finally { try { await client.end() } catch {} }
     }
 
-    /* ---------- bid-nobid-memo ---------- */
+    /* ============ /sb/bid-nobid-memo (Decision + Executive Memo only) ============ */
     if (last === "bid-nobid-memo") {
-      const piid  = (url.searchParams.get("piid")||"").trim().toUpperCase()
-      const uei   = (url.searchParams.get("uei") ||"").trim().toUpperCase()
-      const years = (url.searchParams.get("years")||"5").trim()
-      if (!piid || !uei) return new Response(JSON.stringify({ ok:false, error:"Missing piid or uei" }),
-        { status:400, headers:{ ...headers, "Content-Type":"application/json" }})
-      const bnbURL = new URL(request.url)
+      const piid  = (url.searchParams.get("piid") || "").trim().toUpperCase()
+      const uei   = (url.searchParams.get("uei")  || "").trim().toUpperCase()
+      const years = (url.searchParams.get("years")|| "5").trim()
+      if (!piid || !uei) {
+        return new Response(JSON.stringify({ ok:false, error:"Missing piid or uei" }), {
+          status: 400, headers: { ...headers, "Content-Type":"application/json" }
+        })
+      }
+
+      const bnbURL = new URL(url.toString())
       bnbURL.pathname = "/sb/bid-nobid"
       bnbURL.search = `?piid=${encodeURIComponent(piid)}&uei=${encodeURIComponent(uei)}&years=${encodeURIComponent(years)}`
-      const bRes = await fetch(bnbURL.toString(), { headers:{ "Accept":"application/json" } })
-      const bTxt = await bRes.text()
-      let bnb = {}; try { bnb = bTxt ? JSON.parse(bTxt) : {} } catch {}
-      if (!bRes.ok || bnb?.ok === false) {
-        return new Response(JSON.stringify({ ok:false, error: bnb?.error || "bid-nobid failed" }),
-          { status:500, headers:{ ...headers, "Content-Type":"application/json" }})
+      const bnbRes = await fetch(bnbURL.toString(), { headers: { "Accept":"application/json" } })
+      const bnbTxt = await bnbRes.text()
+      let bnb = {}
+      try { bnb = bnbTxt ? JSON.parse(bnbTxt) : {} } catch { bnb = {} }
+      if (!bnbRes.ok || bnb?.ok === false) {
+        return new Response(JSON.stringify({ ok:false, error: bnb?.error || "bid-nobid failed" }), {
+          status: 500, headers: { ...headers, "Content-Type":"application/json" }
+        })
       }
       if (!env.OPENAI_API_KEY) {
-        return new Response(JSON.stringify({ ok:false, error:"OPENAI_API_KEY not set" }),
-          { status:500, headers:{ ...headers, "Content-Type":"application/json" }})
+        return new Response(JSON.stringify({ ok:false, error:"OPENAI_API_KEY not set" }), {
+          status: 500, headers: { ...headers, "Content-Type":"application/json" }
+        })
       }
-      const matrixLines = (bnb.criteria||[]).map(c =>
-        `${c.name} | weight ${c.weight}% | score ${c.score}/5 | ${c.reason||""}`.trim()
+      const matrixLines = (bnb.criteria || []).map(
+        c => `${c.name} | weight ${c.weight}% | score ${c.score}/5 | ${c.reason || ""}`.trim()
       ).join("\n")
+
       const prompt = `
-You are the Bid/No-Bid Decision GPT. Using the scored matrix, write:
-1) Decision with percent (Bid / Conditional / No-Bid).
-2) A 5–7 line executive memo referencing specific numbers (NAICS match, org history $, socio-econ & set-aside, incumbent strength, schedule/burn, price percentile).
-3) A 5-line emoji risk heat map (🟢🟡🟠🔴).
-4) A 10–14 day capture plan (bullets).
-5) 6–10 precise CO questions.
+You are a Bid/No-Bid Decision writer for federal capture.
+Using the scored matrix below, output ONLY:
+1) A single line Decision (Bid / Conditional / No-Bid) with a short parenthetical justification.
+2) A 5–7 sentence Executive Memo that cites the specific facts (NAICS match, awards in office, set-aside alignment, incumbent strength, price percentile, schedule/burn).
+
+Do NOT include heat maps, plans, or CO questions.
 
 PIID: ${bnb?.inputs?.piid || piid}
-Org: ${bnb?.inputs?.org || "—"} | NAICS: ${bnb?.inputs?.naics || "—"}
-Decision: ${bnb?.decision || "—"} (${bnb?.weighted_percent ?? "—"}%)
+Org: ${bnb?.inputs?.org || "—"}
+NAICS: ${bnb?.inputs?.naics || "—"}
+Current decision: ${bnb?.decision || "—"} (${bnb?.weighted_percent ?? "—"}%)
 
 Matrix:
 ${matrixLines}
-      `.trim()
+`.trim()
+
       const aiRes = await fetch("https://api.openai.com/v1/chat/completions", {
-        method:"POST",
-        headers:{ "Content-Type":"application/json", Authorization:`Bearer ${env.OPENAI_API_KEY}` },
+        method: "POST",
+        headers: { "Content-Type":"application/json", "Authorization":`Bearer ${env.OPENAI_API_KEY}` },
         body: JSON.stringify({
-          model:"gpt-4.1-mini",
-          messages:[
-            { role:"system", content:"You are a federal capture strategist." },
-            { role:"user", content: prompt }
+          model: "gpt-4.1-mini",
+          messages: [
+            { role: "system", content: "You are concise and executive." },
+            { role: "user", content: prompt }
           ],
-          temperature:0.3, max_tokens:900
+          temperature: 0.3, max_tokens: 700
         })
       })
       const aiTxt = await aiRes.text()
-      let memo = ""; try { memo = JSON.parse(aiTxt).choices?.[0]?.message?.content?.trim() || "" } catch { memo = aiTxt.slice(0,3000) }
-      return new Response(JSON.stringify({ ok:true, ...bnb, memo }), {
-        status:200, headers:{ ...headers, "Content-Type":"application/json" }
-      })
+      let memo = ""
+      try { memo = JSON.parse(aiTxt).choices?.[0]?.message?.content?.trim() || "" }
+      catch { memo = aiTxt.slice(0, 3000) }
+
+      // Return only decision + memo (keep weighted for UI if needed)
+      return new Response(JSON.stringify({
+        ok: true,
+        decision: bnb.decision,
+        weighted_percent: bnb.weighted_percent,
+        memo,
+      }), { status: 200, headers: { ...headers, "Content-Type":"application/json" } })
     }
 
-    /* ---------- fallback ---------- */
-    return new Response("Not found", { status:404, headers })
-  }
+    /* ============ /sb/teaming-suggestions ============ */
+    if (last === "teaming-suggestions") {
+      const piid  = (url.searchParams.get("piid") || "").trim().toUpperCase()
+      const uei   = (url.searchParams.get("uei") || "").trim().toUpperCase()
+      const years = Math.max(1, Math.min(10, parseInt(url.searchParams.get("years") || "5", 10)))
+      const limit = Math.max(3, Math.min(10, parseInt(url.searchParams.get("limit") || "5", 10)))
+      if (!piid) {
+        return new Response(JSON.stringify({ ok:false, error:"Missing piid" }), {
+          status:400, headers:{ ...headers, "Content-Type":"application/json" }
+        })
+      }
+
+      const client = makeClient(env)
+      try {
+        await client.connect()
+
+        const anchor = await client.query(`
+          SELECT award_id_piid, ${COL.NAICS} AS naics, COALESCE(title, transaction_description) AS title,
+                 ${COL.AGENCY} AS agency, ${COL.SUB_AGENCY} AS sub_agency, ${COL.OFFICE} AS office,
+                 recipient_uei
+          FROM ${USA_TABLE}
+          WHERE award_id_piid=$1
+          ORDER BY ${COL.END_DATE} DESC NULLS LAST LIMIT 1`, [piid])
+        if (!anchor.rows.length) {
+          return new Response(JSON.stringify({ ok:false, error:"PIID not found" }), {
+            status:404, headers:{ ...headers, "Content-Type":"application/json" }
+          })
+        }
+        const A = anchor.rows[0]
+        const org = A.sub_agency || A.office || A.agency
+        const naics = A.naics
+        const family = (naics || "").slice(0,3)
+        const title = (A.title || "").toLowerCase().replace(/[^a-z0-9\s]/g," ").split(/\s+/).filter(w => w.length>3 && !["services","support","and","for","with","the"].includes(w))
+        const keywords = title.slice(0,4)
+
+        // candidate vendors in same org (exclude me + incumbent), rank by NAICS match + low obligated
+        const fyExpr = "COALESCE(fiscal_year, EXTRACT(YEAR FROM CURRENT_DATE)::int)"
+        const candSql = `
+          SELECT recipient_uei, recipient_name,
+                 SUM(total_dollars_obligated_num) AS obligated,
+                 BOOL_OR(naics_code = $3) AS naics_exact,
+                 BOOL_OR(SUBSTRING(naics_code,1,3) = $4) AS naics_family
+          FROM ${USA_TABLE}
+          WHERE (${fyExpr}) >= EXTRACT(YEAR FROM CURRENT_DATE)::int - ($5::int - 1)
+            AND ($2::text IS NULL OR ${COL.AGENCY}=$2 OR ${COL.SUB_AGENCY}=$2 OR ${COL.OFFICE}=$2)
+            AND recipient_uei NOT IN ($6, $7) -- incumbent, me
+          GROUP BY recipient_uei, recipient_name
+          ORDER BY naics_exact DESC, naics_family DESC, obligated ASC
+          LIMIT $1
+        `
+        const { rows: candidates } = await client.query(candSql, [limit * 6, org, naics, family, years, A.recipient_uei, uei || "NOUEI"])
+
+        // pick top 3–5 after sampling
+        const picks = candidates.slice(0, limit)
+
+        // hydrate each candidate
+        const results = []
+        for (const c of picks) {
+          const awards = await client.query(`
+            SELECT award_id_piid AS piid,
+                   COALESCE(title, transaction_description) AS title,
+                   naics_code AS naics,
+                   total_dollars_obligated_num AS obligated
+            FROM ${USA_TABLE}
+            WHERE recipient_uei=$1
+              AND ($2::text IS NULL OR ${COL.AGENCY}=$2 OR ${COL.SUB_AGENCY}=$2 OR ${COL.OFFICE}=$2)
+              AND (naics_code=$3 OR SUBSTRING(naics_code,1,3)=$4
+                   ${keywords.length ? `OR (${keywords.map((_,i)=>`LOWER(COALESCE(title,transaction_description)) LIKE $${5+i}`).join(" OR ")})` : ""})
+            ORDER BY total_dollars_obligated_num DESC NULLS LAST
+            LIMIT 3
+          `, [c.recipient_uei, org, naics, family, ...keywords.map(k=>`%${k}%`)])
+
+          // sample set-aside most frequent at org
+          const sa = await client.query(`
+            SELECT type_of_set_aside AS sa, COUNT(*) AS n
+            FROM ${USA_TABLE}
+            WHERE recipient_uei=$1
+              AND ($2::text IS NULL OR ${COL.AGENCY}=$2 OR ${COL.SUB_AGENCY}=$2 OR ${COL.OFFICE}=$2)
+              AND type_of_set_aside IS NOT NULL
+            GROUP BY type_of_set_aside
+            ORDER BY n DESC
+            LIMIT 1`, [c.recipient_uei, org])
+          const saBest = sa.rows[0]?.sa || null
+
+          const sam = await fetchVendorContactsByUEI(c.recipient_uei, env)
+
+          results.push({
+            vendor: {
+              uei: c.recipient_uei,
+              name: c.recipient_name,
+              website: sam.website || null,
+              contact: sam.contact || null,
+              setAside: saBest,
+            },
+            stats: { awards: Number(c.awards || 0), obligated: Number(c.obligated || 0) },
+            sampleAwards: (awards.rows || []).map(r => ({
+              piid: r.piid, title: r.title || null, naics: r.naics || null,
+              obligated: typeof r.obligated === "number" ? r.obligated : Number(r.obligated || 0),
+            })),
+          })
+        }
+
+        return new Response(JSON.stringify({ ok:true, org, naics, suggestions: results }), {
+          status:200, headers:{ ...headers, "Content-Type":"application/json" }
+        })
+      } catch (e) {
+        try { await client.end() } catch {}
+        return new Response(JSON.stringify({ ok:false, error:e?.message || "teaming failed" }), {
+          status:500, headers:{ ...headers, "Content-Type":"application/json" }
+        })
+      } finally { try { await client.end() } catch {} }
+    }
+
+    // Fallback
+    return new Response("Not found", { status: 404, headers })
+  },
 }
