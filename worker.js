@@ -417,7 +417,81 @@ export default {
         })
       }
     }
+/* =============================================================
+ * Vendor awards list (last N fiscal years, filtered by agency)
+ *    GET /sb/vendor-awards?uei=XXXX&agency=Dept%20of%20Defense&years=5&limit=100
+ * =========================================================== */
+if (last === "vendor-awards") {
+  const uei = (url.searchParams.get("uei") || "").trim()
+  const agency = (url.searchParams.get("agency") || "").trim()
+  const years = Math.max(1, Math.min(10, parseInt(url.searchParams.get("years") || "5", 10)))
+  const limit = Math.max(1, Math.min(300, parseInt(url.searchParams.get("limit") || "100", 10)))
 
+  if (!uei) {
+    return new Response(JSON.stringify({ ok: false, error: "Missing uei" }), {
+      status: 400,
+      headers: { ...headers, "Content-Type": "application/json" },
+    })
+  }
+
+  const client = makeClient(env)
+  try {
+    await client.connect()
+    // keep runaway scans in check
+    try { await client.query("SET LOCAL statement_timeout = '15000'") } catch {}
+
+    const sql = `
+      SELECT
+        award_id_piid                                            AS piid,
+        fiscal_year                                              AS fiscal_year,
+        awarding_agency_name                                     AS agency,
+        awarding_sub_agency_name                                 AS sub_agency,
+        awarding_office_name                                     AS office,
+        naics_code                                               AS naics,
+        COALESCE(type_set_aside, type_of_set_aside, set_aside)   AS set_aside,
+        COALESCE(idv_type, idv_type_of_award, award_type, contract_vehicle, contract_award_type) AS vehicle,
+        total_dollars_obligated_num                              AS obligated
+      FROM ${USA_TABLE}
+      WHERE recipient_uei = $1
+        AND fiscal_year >= EXTRACT(YEAR FROM CURRENT_DATE)::int - ($2::int - 1)
+        AND (
+          $3::text IS NULL
+          OR awarding_agency_name      = $3
+          OR awarding_sub_agency_name  = $3
+          OR awarding_office_name      = $3
+        )
+      ORDER BY fiscal_year DESC, pop_current_end_date DESC NULLS LAST, piid DESC
+      LIMIT $4
+    `
+    const params = [uei, years, agency || null, limit]
+    const { rows } = await client.query(sql, params)
+    ctx.waitUntil(client.end())
+
+    const data = (rows || []).map((r) => ({
+      piid: r.piid,
+      fiscal_year: Number(r.fiscal_year),
+      agency: r.agency,
+      sub_agency: r.sub_agency,
+      office: r.office,
+      naics: r.naics,
+      set_aside: r.set_aside,
+      vehicle: r.vehicle,
+      obligated:
+        typeof r.obligated === "number" ? r.obligated : Number(r.obligated || 0),
+    }))
+
+    return new Response(JSON.stringify({ ok: true, rows: data }), {
+      status: 200,
+      headers: { ...headers, "Content-Type": "application/json" },
+    })
+  } catch (e) {
+    try { await client.end() } catch {}
+    return new Response(JSON.stringify({ ok: false, error: e?.message || "query failed" }), {
+      status: 500,
+      headers: { ...headers, "Content-Type": "application/json" },
+    })
+  }
+}
     /* =============================================================
      * 3) Contract insights (AI + subcontracts)
      *    POST /sb/contracts/insights  { piid: "HC102825F0042" }
