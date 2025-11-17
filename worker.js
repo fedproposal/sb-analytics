@@ -205,6 +205,133 @@ export default {
     }
 
     /* =============================================================
+     * Vendor–Agency summary
+     *    GET /sb/vendor-summary?uei=XXXX&agency=Dept%20of%20Defense
+     *
+     *  - uei   (required): recipient UEI
+     *  - agency (optional): matches agency / sub-agency / office
+     *    using the same equality logic as expiring-contracts.
+     *
+     *  Returns:
+     *    {
+     *      ok: true,
+     *      vendor: { uei, name },
+     *      agencyFilter: string | null,
+     *      totals: {
+     *        awards: number,
+     *        obligated: number,
+     *        ceiling: number
+     *      },
+     *      byYear: [
+     *        { fiscalYear, awards, obligated, ceiling }
+     *      ]
+     *    }
+     * =========================================================== */
+    if (last === "vendor-summary") {
+      const uei = (url.searchParams.get("uei") || "").trim()
+      const agencyFilter = (url.searchParams.get("agency") || "").trim()
+
+      if (!uei) {
+        return new Response(
+          JSON.stringify({ ok: false, error: "Missing uei parameter." }),
+          { status: 400, headers: { ...headers, "Content-Type": "application/json" } },
+        )
+      }
+
+      const client = makeClient(env)
+
+      try {
+        await client.connect()
+
+        // 1) Basic vendor name (best-effort – just grab one row)
+        const vendorSql = `
+          SELECT recipient_name
+          FROM ${USA_TABLE}
+          WHERE recipient_uei = $1
+          ORDER BY total_dollars_obligated_num DESC NULLS LAST
+          LIMIT 1
+        `
+        const vendorRes = await client.query(vendorSql, [uei])
+        const vendorName = vendorRes.rows[0]?.recipient_name || null
+
+        // 2) Totals + yearly breakdown
+        // NOTE: this assumes a "fiscal_year" column exists on your view.
+        // If your view uses a different year column, swap it in here.
+        const summarySql = `
+          SELECT
+            fiscal_year,
+            COUNT(*)                                    AS awards,
+            SUM(total_dollars_obligated_num)           AS obligated,
+            SUM(potential_total_value_of_award_num)    AS ceiling
+          FROM ${USA_TABLE}
+          WHERE recipient_uei = $1
+            AND (
+              $2::text IS NULL
+              OR awarding_agency_name      = $2
+              OR awarding_sub_agency_name  = $2
+              OR awarding_office_name      = $2
+            )
+          GROUP BY fiscal_year
+          ORDER BY fiscal_year DESC
+        `
+        const summaryRes = await client.query(summarySql, [
+          uei,
+          agencyFilter || null,
+        ])
+
+        const byYear = (summaryRes.rows || []).map((r) => ({
+          fiscalYear: r.fiscal_year,
+          awards: Number(r.awards || 0),
+          obligated:
+            typeof r.obligated === "number"
+              ? r.obligated
+              : Number(r.obligated || 0),
+          ceiling:
+            typeof r.ceiling === "number"
+              ? r.ceiling
+              : Number(r.ceiling || 0),
+        }))
+
+        const totals = byYear.reduce(
+          (acc, y) => {
+            acc.awards += y.awards
+            acc.obligated += y.obligated
+            acc.ceiling += y.ceiling
+            return acc
+          },
+          { awards: 0, obligated: 0, ceiling: 0 },
+        )
+
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            vendor: { uei, name: vendorName },
+            agencyFilter: agencyFilter || null,
+            totals,
+            byYear,
+          }),
+          { status: 200, headers: { ...headers, "Content-Type": "application/json" } },
+        )
+      } catch (e) {
+        try {
+          await client.end()
+        } catch {}
+        return new Response(
+          JSON.stringify({ ok: false, error: e?.message || "query failed" }),
+          {
+            status: 500,
+            headers: { ...headers, "Content-Type": "application/json" },
+          },
+        )
+      } finally {
+        try {
+          await client.end()
+        } catch {}
+      }
+    }
+
+    
+    /* =============================================================
      * 2) Expiring Contracts (Neon-backed)
      *    GET /sb/expiring-contracts?naics=541519&agency=VA&window_days=180&limit=50
      *    (or any route whose last segment is `expiring-contracts`)
