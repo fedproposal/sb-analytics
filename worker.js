@@ -688,7 +688,7 @@ export default {
                 .map((s) => `${s.name} (UEI ${s.uei || "unknown"})`)
                 .join(", ")}.`
 
-        const prompt = `
+                const prompt = `
 You are helping a small federal contractor quickly understand a single contract and how to position for a recompete or subcontracting role.
 
 Treat the lifecycle, burn %, and subcontracting figures below as correct. Do not contradict them.
@@ -702,21 +702,24 @@ Contract snapshot:
 - Period of performance: ${primary.popStartDate || "—"} to ${
           primary.popCurrentEndDate || "—"
         } (potential: ${primary.popPotentialEndDate || "—"})
-- Lifecycle: ${lifecycle.label} (time elapsed ≈${
+- Lifecycle stage: ${lifecycleStage} (${lifecycle.label}, time elapsed ≈${
           timeElapsedPct == null ? "unknown" : timeElapsedPct + "%"
         })
 - Burn vs ceiling: ${burnText}
 - Subcontracting footprint: ${subsText} ${topSubText}
 
-Write 4–5 bullet points that:
-1) Explain where this contract is in its lifecycle and what that means tactically.
-2) Interpret how heavily used the vehicle is based on burn vs ceiling (and whether there is room left for work).
-3) Describe what the subcontracting pattern suggests (no subs, concentrated with a few, or spread across many) and how that affects teaming strategy.
-4) Give concrete next actions for a small business (e.g., which offices or primes/subs to talk to, what to research, and when in the likely recompete window to act).
+Write 4–5 bullet points that are tailored to the current lifecycle stage:
+
+- If stage is NOT_STARTED: focus on pre-award shaping, early outreach, and building past performance.
+- If stage is EARLY or MID: focus on influencing future options/task orders and monitoring burn vs ceiling.
+- If stage is LATE or COMPLETE: focus on recompete timing, positioning, and teaming strategies.
+- Always explain what burn % and subcontracting patterns mean in plain language.
+- Recommend concrete next actions: which offices, primes, or named subs to talk to; what to research; and roughly when (in months) to act relative to the likely recompete window.
 
 Avoid generic advice like "build relationships" unless you tie it specifically to the agency, office, prime, or named subs above.
-Keep it under 200 words, concise, and non-technical.
+Keep it under 180 words, concise, and non-technical.
         `.trim()
+        
 
         const aiRes = await fetch("https://api.openai.com/v1/chat/completions", {
           method: "POST",
