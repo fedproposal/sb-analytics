@@ -420,6 +420,7 @@ export default {
 /* =============================================================
  * Vendor awards list (last N fiscal years, filtered by agency)
  *    GET /sb/vendor-awards?uei=XXXX&agency=Dept%20of%20Defense&years=5&limit=100
+ * Robust to missing fiscal_year column.
  * =========================================================== */
 if (last === "vendor-awards") {
   const uei = (url.searchParams.get("uei") || "").trim()
@@ -429,21 +430,18 @@ if (last === "vendor-awards") {
 
   if (!uei) {
     return new Response(JSON.stringify({ ok: false, error: "Missing uei" }), {
-      status: 400,
-      headers: { ...headers, "Content-Type": "application/json" },
+      status: 400, headers: { ...headers, "Content-Type": "application/json" },
     })
   }
 
   const client = makeClient(env)
   try {
     await client.connect()
-    // Session-level timeout is allowed anywhere
     try { await client.query("SET statement_timeout = '15000'") } catch {}
 
-    // Detect which optional columns exist on the view so we don't reference missing ones
+    // Column discovery
     const schema = USA_TABLE.includes(".") ? USA_TABLE.split(".")[0] : "public"
     const table  = USA_TABLE.includes(".") ? USA_TABLE.split(".")[1] : USA_TABLE
-
     const colsRes = await client.query(
       `SELECT column_name FROM information_schema.columns
        WHERE table_schema = $1 AND table_name = $2`,
@@ -452,49 +450,78 @@ if (last === "vendor-awards") {
     const have = new Set((colsRes.rows || []).map(r => String(r.column_name).toLowerCase()))
     const has = (c) => have.has(String(c).toLowerCase())
 
-    const coalesceText = (...names) => {
-      const alive = names.filter(has)
-      if (!alive.length) return "NULL"
-      // cast to text so COALESCE works across differing underlying types
-      return `COALESCE(${alive.map(n => `${n}::text`).join(", ")})`
+    // Build the best available fiscal-year expression
+    // Preference order: explicit FY column → action_date FY → PoP end FY → current year
+    let fyExpr = null
+    if (has("fiscal_year")) {
+      fyExpr = "fiscal_year"
+    } else if (has("action_date_fiscal_year")) {
+      fyExpr = "action_date_fiscal_year"
+    } else if (has("action_date")) {
+      fyExpr = `CASE WHEN EXTRACT(MONTH FROM action_date)::int >= 10
+                    THEN EXTRACT(YEAR FROM action_date)::int + 1
+                    ELSE EXTRACT(YEAR FROM action_date)::int
+               END`
+    } else if (has("pop_current_end_date")) {
+      fyExpr = `CASE WHEN EXTRACT(MONTH FROM pop_current_end_date)::int >= 10
+                    THEN EXTRACT(YEAR FROM pop_current_end_date)::int + 1
+                    ELSE EXTRACT(YEAR FROM pop_current_end_date)::int
+               END`
+    } else if (has("period_of_performance_current_end_date")) {
+      fyExpr = `CASE WHEN EXTRACT(MONTH FROM period_of_performance_current_end_date)::int >= 10
+                    THEN EXTRACT(YEAR FROM period_of_performance_current_end_date)::int + 1
+                    ELSE EXTRACT(YEAR FROM period_of_performance_current_end_date)::int
+               END`
+    } else {
+      fyExpr = "EXTRACT(YEAR FROM CURRENT_DATE)::int" // worst-case fallback
     }
 
-    const setAsideExpr = coalesceText("type_of_set_aside", "type_set_aside", "set_aside")
-    const vehicleExpr  = coalesceText("idv_type", "idv_type_of_award", "contract_vehicle", "contract_award_type", "award_type")
+    const setAsideExpr = (() => {
+      const c = ["type_of_set_aside","type_set_aside","set_aside"].filter(has)
+      return c.length ? `COALESCE(${c.map(n=>`${n}::text`).join(",")})` : "NULL"
+    })()
 
+    const vehicleExpr = (() => {
+      const c = ["idv_type","idv_type_of_award","contract_vehicle","contract_award_type","award_type"].filter(has)
+      return c.length ? `COALESCE(${c.map(n=>`${n}::text`).join(",")})` : "NULL"
+    })()
+
+    // Use a subquery to compute FY once and filter/rank on it
     const sql = `
-      SELECT
-        award_id_piid                               AS piid,
-        fiscal_year                                 AS fiscal_year,
-        awarding_agency_name                        AS agency,
-        awarding_sub_agency_name                    AS sub_agency,
-        awarding_office_name                        AS office,
-        naics_code                                  AS naics,
-        ${setAsideExpr}                             AS set_aside,
-        ${vehicleExpr}                              AS vehicle,
-        total_dollars_obligated_num                 AS obligated
-      FROM ${USA_TABLE}
-      WHERE recipient_uei = $1
-        AND fiscal_year >= EXTRACT(YEAR FROM CURRENT_DATE)::int - ($2::int - 1)
-        AND (
-          $3::text IS NULL
-          OR awarding_agency_name      = $3
-          OR awarding_sub_agency_name  = $3
-          OR awarding_office_name      = $3
-        )
-      ORDER BY fiscal_year DESC, pop_current_end_date DESC NULLS LAST, piid DESC
+      SELECT *
+      FROM (
+        SELECT
+          award_id_piid                                   AS piid,
+          (${fyExpr})                                     AS fiscal_year,
+          awarding_agency_name                            AS agency,
+          awarding_sub_agency_name                        AS sub_agency,
+          awarding_office_name                            AS office,
+          naics_code                                      AS naics,
+          ${setAsideExpr}                                 AS set_aside,
+          ${vehicleExpr}                                  AS vehicle,
+          total_dollars_obligated_num                     AS obligated,
+          pop_current_end_date                            AS pop_end
+        FROM ${USA_TABLE}
+        WHERE recipient_uei = $1
+          AND (
+            $2::text IS NULL
+            OR awarding_agency_name      = $2
+            OR awarding_sub_agency_name  = $2
+            OR awarding_office_name      = $2
+          )
+      ) q
+      WHERE q.fiscal_year >= EXTRACT(YEAR FROM CURRENT_DATE)::int - ($3::int - 1)
+      ORDER BY q.fiscal_year DESC, q.pop_end DESC NULLS LAST, q.piid DESC
       LIMIT $4
     `
-    const params = [uei, years, agency || null, limit]
+    const params = [uei, agency || null, years, limit]
     const { rows } = await client.query(sql, params)
     ctx.waitUntil(client.end())
 
     const data = (rows || []).map(r => ({
       piid: r.piid,
       fiscal_year: Number(r.fiscal_year),
-      agency: r.agency,
-      sub_agency: r.sub_agency,
-      office: r.office,
+      agency: r.agency, sub_agency: r.sub_agency, office: r.office,
       naics: r.naics,
       set_aside: r.set_aside || null,
       vehicle: r.vehicle || null,
@@ -502,14 +529,12 @@ if (last === "vendor-awards") {
     }))
 
     return new Response(JSON.stringify({ ok: true, rows: data }), {
-      status: 200,
-      headers: { ...headers, "Content-Type": "application/json" },
+      status: 200, headers: { ...headers, "Content-Type": "application/json" },
     })
   } catch (e) {
     try { await client.end() } catch {}
     return new Response(JSON.stringify({ ok: false, error: e?.message || "query failed" }), {
-      status: 500,
-      headers: { ...headers, "Content-Type": "application/json" },
+      status: 500, headers: { ...headers, "Content-Type": "application/json" },
     })
   }
 }
