@@ -942,7 +942,73 @@ Keep it under 180 words, concise, and non-technical.
         try { await client.end() } catch {}
       }
     }
+/* =============================================================
+ * MY ENTITY
+ *   GET /sb/my-entity?uei=XXXX
+ *   -> { ok: true, entity: { uei, name, naics:[...], smallBizCategories:[...] } }
+ * =========================================================== */
+if (last === "my-entity") {
+  const uei = (url.searchParams.get("uei") || "").trim().toUpperCase()
+  if (!uei) {
+    return new Response(JSON.stringify({ ok:false, error:"Missing uei parameter." }), {
+      status:400, headers:{ ...headers, "Content-Type":"application/json" }
+    })
+  }
 
+  const client = makeClient(env)
+  try {
+    await client.connect()
+
+    // Best-effort name from awards
+    const nameRes = await client.query(
+      `SELECT recipient_name
+       FROM ${USA_TABLE}
+       WHERE recipient_uei = $1
+       ORDER BY total_dollars_obligated_num DESC NULLS LAST
+       LIMIT 1`, [uei]
+    )
+    const name = nameRes.rows[0]?.recipient_name || null
+
+    // NAICS from awards
+    const naicsRes = await client.query(
+      `SELECT DISTINCT naics_code
+       FROM ${USA_TABLE}
+       WHERE recipient_uei = $1 AND naics_code IS NOT NULL
+       LIMIT 200`, [uei]
+    )
+    const naics = (naicsRes.rows || []).map(r => r.naics_code).filter(Boolean)
+
+    // Optional SAM enrichment (prime/company socio-econ categories)
+    let smallBizCategories = []
+    try {
+      if (env.SAM_PROXY_URL) {
+        const samUrl = `${env.SAM_PROXY_URL.replace(/\/+$/, "")}/entity?uei=${encodeURIComponent(uei)}`
+        const samRes = await fetch(samUrl)
+        if (samRes.ok) {
+          const samJson = await samRes.json().catch(() => null)
+          const cats =
+            samJson?.categories ||
+            samJson?.entity?.socioEconomicCategories || []
+          smallBizCategories = Array.from(new Set((cats || []).filter(Boolean)))
+        }
+      }
+    } catch {}
+
+    return new Response(
+      JSON.stringify({ ok:true, entity:{ uei, name, naics, smallBizCategories } }),
+      { status:200, headers:{ ...headers, "Content-Type":"application/json" } }
+    )
+  } catch (e) {
+    try { await client.end() } catch {}
+    return new Response(JSON.stringify({ ok:false, error:e?.message || "query failed" }), {
+      status:500, headers:{ ...headers, "Content-Type":"application/json" }
+    })
+  } finally {
+    try { await client.end() } catch {}
+  }
+}
+
+    
     // ---------- Fallback ----------
     return new Response("Not found", { status: 404, headers })
   },
