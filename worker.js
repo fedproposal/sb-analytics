@@ -437,20 +437,42 @@ if (last === "vendor-awards") {
   const client = makeClient(env)
   try {
     await client.connect()
-    // keep runaway scans in check
-    try { await client.query("SET LOCAL statement_timeout = '15000'") } catch {}
+    // Session-level timeout is allowed anywhere
+    try { await client.query("SET statement_timeout = '15000'") } catch {}
+
+    // Detect which optional columns exist on the view so we don't reference missing ones
+    const schema = USA_TABLE.includes(".") ? USA_TABLE.split(".")[0] : "public"
+    const table  = USA_TABLE.includes(".") ? USA_TABLE.split(".")[1] : USA_TABLE
+
+    const colsRes = await client.query(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_schema = $1 AND table_name = $2`,
+      [schema, table]
+    )
+    const have = new Set((colsRes.rows || []).map(r => String(r.column_name).toLowerCase()))
+    const has = (c) => have.has(String(c).toLowerCase())
+
+    const coalesceText = (...names) => {
+      const alive = names.filter(has)
+      if (!alive.length) return "NULL"
+      // cast to text so COALESCE works across differing underlying types
+      return `COALESCE(${alive.map(n => `${n}::text`).join(", ")})`
+    }
+
+    const setAsideExpr = coalesceText("type_of_set_aside", "type_set_aside", "set_aside")
+    const vehicleExpr  = coalesceText("idv_type", "idv_type_of_award", "contract_vehicle", "contract_award_type", "award_type")
 
     const sql = `
       SELECT
-        award_id_piid                                            AS piid,
-        fiscal_year                                              AS fiscal_year,
-        awarding_agency_name                                     AS agency,
-        awarding_sub_agency_name                                 AS sub_agency,
-        awarding_office_name                                     AS office,
-        naics_code                                               AS naics,
-        COALESCE(type_set_aside, type_of_set_aside, set_aside)   AS set_aside,
-        COALESCE(idv_type, idv_type_of_award, award_type, contract_vehicle, contract_award_type) AS vehicle,
-        total_dollars_obligated_num                              AS obligated
+        award_id_piid                               AS piid,
+        fiscal_year                                 AS fiscal_year,
+        awarding_agency_name                        AS agency,
+        awarding_sub_agency_name                    AS sub_agency,
+        awarding_office_name                        AS office,
+        naics_code                                  AS naics,
+        ${setAsideExpr}                             AS set_aside,
+        ${vehicleExpr}                              AS vehicle,
+        total_dollars_obligated_num                 AS obligated
       FROM ${USA_TABLE}
       WHERE recipient_uei = $1
         AND fiscal_year >= EXTRACT(YEAR FROM CURRENT_DATE)::int - ($2::int - 1)
@@ -467,17 +489,16 @@ if (last === "vendor-awards") {
     const { rows } = await client.query(sql, params)
     ctx.waitUntil(client.end())
 
-    const data = (rows || []).map((r) => ({
+    const data = (rows || []).map(r => ({
       piid: r.piid,
       fiscal_year: Number(r.fiscal_year),
       agency: r.agency,
       sub_agency: r.sub_agency,
       office: r.office,
       naics: r.naics,
-      set_aside: r.set_aside,
-      vehicle: r.vehicle,
-      obligated:
-        typeof r.obligated === "number" ? r.obligated : Number(r.obligated || 0),
+      set_aside: r.set_aside || null,
+      vehicle: r.vehicle || null,
+      obligated: typeof r.obligated === "number" ? r.obligated : Number(r.obligated || 0),
     }))
 
     return new Response(JSON.stringify({ ok: true, rows: data }), {
