@@ -671,7 +671,12 @@ Contract snapshot:
 - ${burnText}
 - Subcontracting footprint: ${subsText} ${topSubText}
 
-Write 4–5 bullet points tailored to the lifecycle stage (pre-capture if NOT_STARTED, capture if EARLY/MID, recompete if LATE/COMPLETE). Be specific to the agency/office/prime. ≤180 words.
+Write 4–6 bullets that:
+- state the lifecycle stage & what that means for capture timing,
+- explain the Fit Score drivers for UEI {MY_UEI}: NAICS match, awards at this org, socio-economic match to prior set-asides, and incumbent presence,
+- give 3 specific next actions to raise the score (teaming, intel calls, vehicles, set-aside alignment),
+- keep it under 170 words, no fluff.
+When data is missing, say “unknown” once and move on.
         `.trim()
 
         const aiRes = await fetch("https://api.openai.com/v1/chat/completions", {
