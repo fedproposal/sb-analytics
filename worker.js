@@ -467,12 +467,12 @@ export default {
         }))
 
         return new Response(JSON.stringify({ ok: true, rows: data }), {
-          status: 200, headers: { ...headers, "Content-Type": "application/json" },
+          status: 200, headers: { ...headers, "Content-Type":"application/json" },
         })
       } catch (e) {
         try { await client.end() } catch {}
         return new Response(JSON.stringify({ ok: false, error: e?.message || "query failed" }), {
-          status: 500, headers: { ...headers, "Content-Type": "application/json" },
+          status: 500, headers: { ...headers, "Content-Type":"application/json" },
         })
       }
     }
@@ -832,7 +832,7 @@ When data is missing, say “unknown” once and move on.
         const orgName = A.awarding_sub_agency_name || A.awarding_office_name || A.awarding_agency_name
         const naics = A.naics_code
 
-        // my SAM profile (via our own route)
+        // my SAM profile (call our own route on same origin)
         const myEntRes = await fetch(`${url.origin}/sb/my-entity?uei=${encodeURIComponent(uei)}`)
         const myEntJson = await myEntRes.json().catch(()=>({}))
         const myNAICS = (myEntJson?.entity?.naics || []).filter(Boolean)
@@ -883,11 +883,15 @@ When data is missing, say “unknown” once and move on.
         `,[naics, orgName, years])
         const P = dist.rows[0] || { p25:null, p50:null, p75:null }
 
-        // set-aside tendency
+        // set-aside tendency — detect whichever column exists
+        const setCols = ["type_set_aside","type_of_set_aside","set_aside"]
+        const present = setCols.filter(c => have.has(c))
+        const setExpr = present.length ? `COALESCE(${present.map(c=>`${c}::text`).join(",")})` : "NULL"
+
         const setAside = await client.query(`
-          SELECT COUNT(*) FILTER (WHERE COALESCE(type_of_set_aside, idv_type_of_award) IS NOT NULL)::int AS known,
+          SELECT COUNT(*) FILTER (WHERE ${setExpr} IS NOT NULL)::int AS known,
                  COUNT(*)::int AS total,
-                 MAX(COALESCE(type_of_set_aside, idv_type_of_award)) AS example_set_aside
+                 MAX(${setExpr}) AS example_set_aside
           FROM ${USA_TABLE}
           WHERE naics_code=$1
             AND (
@@ -987,7 +991,7 @@ When data is missing, say “unknown” once and move on.
             { name:"Relevant Experience / Past Performance", weight:20, score:pp, reason:`Your awards at this org: ${meCnt}; $${Math.round(meObl).toLocaleString()}` },
             { name:"Staffing & Key Personnel", weight:12, score:staffing, reason:"Proxy via local award size distribution" },
             { name:"Schedule / ATO Timeline Risk", weight:8, score:sched, reason:`Days to end: ${daysToEnd ?? "unknown"}; burn: ${burn ?? "unknown"}%` },
-            { name:"Compliance", weight:8, score:comp, reason: (setAside.rows[0]?.example_set_aside || "Set-aside").toString() },
+            { name:"Compliance", weight:8, score:comp, reason: example || "Set-aside unknown" },
             { name:"Price Competitiveness", weight:8, score:price, reason:"Position vs NAICS@org percentiles" },
             { name:"Customer Intimacy", weight:10, score:intimacy, reason:`Your awards at this org: ${meCnt}` },
             { name:"Competitive Intelligence", weight:10, score:compIntel, reason:`Incumbent awards: ${incCnt}` },
