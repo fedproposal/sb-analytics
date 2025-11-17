@@ -25,7 +25,7 @@ function makeClient(env) {
   return new Client({ connectionString: env.HYPERDRIVE.connectionString, ssl: { rejectUnauthorized: false } })
 }
 
-const USA_TABLE = "public.usaspending_awards_v1"
+const USA_TABLE = "public.usaspending_awards_v2"
 const COL = {
   END_DATE: "pop_current_end_date",
   NAICS: "naics_code",
