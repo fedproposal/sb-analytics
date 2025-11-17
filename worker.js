@@ -782,7 +782,319 @@ When data is missing, say “unknown” once and move on.
         try { await client.end() } catch {}
       }
     }
+// ===================== Bid/No-Bid (UEI + PIID) =====================
+// GET /sb/bid-nobid?piid=HC102825F0042&uei=MKA4F1KQSSB5&years=5
+if (last === "bid-nobid") {
+  const piid = (url.searchParams.get("piid") || "").trim().toUpperCase()
+  const uei  = (url.searchParams.get("uei")  || "").trim().toUpperCase()
+  const years = Math.max(1, Math.min(10, parseInt(url.searchParams.get("years") || "5", 10)))
+  if (!piid || !uei) {
+    return new Response(JSON.stringify({ ok:false, error:"Missing piid or uei" }),
+      { status:400, headers:{ ...headers, "Content-Type":"application/json" }})
+  }
 
+  const client = makeClient(env)
+  try {
+    await client.connect()
+    // ---------- discover FY column ----------
+    const schema = USA_TABLE.includes(".") ? USA_TABLE.split(".")[0] : "public"
+    const table  = USA_TABLE.includes(".") ? USA_TABLE.split(".")[1] : USA_TABLE
+    const cols = await client.query(
+      `SELECT column_name FROM information_schema.columns WHERE table_schema=$1 AND table_name=$2`,
+      [schema, table]
+    )
+    const have = new Set((cols.rows||[]).map(r=>String(r.column_name).toLowerCase()))
+    const has  = (c:string)=> have.has(c.toLowerCase())
+    const fyExpr = has("fiscal_year") ? "fiscal_year"
+      : has("action_date_fiscal_year") ? "action_date_fiscal_year"
+      : has("action_date") ? `CASE WHEN EXTRACT(MONTH FROM action_date)::int>=10
+                               THEN EXTRACT(YEAR FROM action_date)::int+1
+                               ELSE EXTRACT(YEAR FROM action_date)::int END`
+      : `EXTRACT(YEAR FROM CURRENT_DATE)::int`
+
+    // ---------- award snapshot for this PIID ----------
+    const award = await client.query(`
+      SELECT award_id_piid, naics_code, naics_description,
+             awarding_agency_name, awarding_sub_agency_name, awarding_office_name,
+             recipient_uei, recipient_name,
+             total_dollars_obligated_num AS obligated,
+             potential_total_value_of_award_num AS ceiling,
+             pop_current_end_date
+      FROM ${USA_TABLE}
+      WHERE award_id_piid = $1
+      ORDER BY pop_current_end_date DESC NULLS LAST
+      LIMIT 1`, [piid])
+    if (!award.rows.length) {
+      return new Response(JSON.stringify({ ok:false, error:"PIID not found" }),
+        { status:404, headers:{ ...headers, "Content-Type":"application/json" }})
+    }
+    const A = award.rows[0]
+    const orgName = A.awarding_sub_agency_name || A.awarding_office_name || A.awarding_agency_name
+    const naics = A.naics_code
+
+    // ---------- my SAM profile (cached in your /sb/my-entity) ----------
+    const myEntRes = await fetch(`${SB_API_BASE}/my-entity?uei=${encodeURIComponent(uei)}`)
+    const myEntJson = await myEntRes.json().catch(()=>({}))
+    const myNAICS: string[] = (myEntJson?.entity?.naics || []).filter(Boolean)
+    const mySocio: string[] = (myEntJson?.entity?.socio || myEntJson?.entity?.smallBizCategories || []).filter(Boolean)
+
+    // ---------- my awards at this org (last N FY) ----------
+    const myAwards = await client.query(`
+      SELECT COUNT(*)::int AS cnt, COALESCE(SUM(total_dollars_obligated_num),0)::float8 AS obligated
+      FROM ${USA_TABLE}
+      WHERE recipient_uei = $1
+        AND (
+          $2::text IS NULL OR awarding_agency_name=$2
+          OR awarding_sub_agency_name=$2 OR awarding_office_name=$2
+        )
+        AND (${fyExpr}) >= EXTRACT(YEAR FROM CURRENT_DATE)::int - ($3::int - 1)
+    `,[uei, orgName, years])
+
+    // ---------- incumbent strength at this org ----------
+    const inc = await client.query(`
+      SELECT COUNT(*)::int AS cnt, COALESCE(SUM(total_dollars_obligated_num),0)::float8 AS obligated
+      FROM ${USA_TABLE}
+      WHERE recipient_uei = $1
+        AND (
+          $2::text IS NULL OR awarding_agency_name=$2
+          OR awarding_sub_agency_name=$2 OR awarding_office_name=$2
+        )
+        AND (${fyExpr}) >= EXTRACT(YEAR FROM CURRENT_DATE)::int - ($3::int - 1)
+    `,[A.recipient_uei, orgName, years])
+
+    // ---------- market distribution for NAICS@org (price proxy) ----------
+    const dist = await client.query(`
+      WITH base AS (
+        SELECT total_dollars_obligated_num AS obligated
+        FROM ${USA_TABLE}
+        WHERE naics_code = $1
+          AND (
+            $2::text IS NULL OR awarding_agency_name=$2
+            OR awarding_sub_agency_name=$2 OR awarding_office_name=$2
+          )
+          AND (${fyExpr}) >= EXTRACT(YEAR FROM CURRENT_DATE)::int - ($3::int - 1)
+          AND total_dollars_obligated_num IS NOT NULL
+      )
+      SELECT
+        percentile_cont(0.25) WITHIN GROUP (ORDER BY obligated)::float8 AS p25,
+        percentile_cont(0.50) WITHIN GROUP (ORDER BY obligated)::float8 AS p50,
+        percentile_cont(0.75) WITHIN GROUP (ORDER BY obligated)::float8 AS p75
+      FROM base
+    `,[naics, orgName, years])
+    const P = dist.rows[0] || { p25:null, p50:null, p75:null }
+
+    // ---------- historic set-aside tendency for this NAICS@org ----------
+    const setAside = await client.query(`
+      SELECT COUNT(*) FILTER (WHERE COALESCE(type_of_set_aside, idv_type_of_award) IS NOT NULL)::int AS known,
+             COUNT(*)::int AS total,
+             MAX(COALESCE(type_of_set_aside, idv_type_of_award)) AS example_set_aside
+      FROM ${USA_TABLE}
+      WHERE naics_code=$1
+        AND (
+          $2::text IS NULL OR awarding_agency_name=$2
+          OR awarding_sub_agency_name=$2 OR awarding_office_name=$2
+        )
+        AND (${fyExpr}) >= EXTRACT(YEAR FROM CURRENT_DATE)::int - ($3::int - 1)
+    `,[naics, orgName, years])
+
+    // ---------- Scoring helpers ----------
+    const toNum = (x:any)=> typeof x === "number"? x : x==null? 0 : Number(x)||0
+    const meCnt = toNum(myAwards.rows[0]?.cnt)
+    const meObl = toNum(myAwards.rows[0]?.obligated)
+    const incCnt = toNum(inc.rows[0]?.cnt)
+    const incObl = toNum(inc.rows[0]?.obligated)
+    const today = new Date()
+    const dEnd = A.pop_current_end_date ? new Date(A.pop_current_end_date) : null
+    const daysToEnd = dEnd ? Math.round((dEnd.getTime() - today.getTime())/86400000) : null
+    const burn = A.ceiling && A.ceiling>0 ? Math.round((toNum(A.obligated)/toNum(A.ceiling))*100) : null
+
+    // Technical fit 1–5
+    const tech =
+      myNAICS.includes(naics) ? 5 :
+      myNAICS.some(c=> c?.slice(0,3)===String(naics).slice(0,3)) ? 4 : 2
+
+    // Past performance 1–5
+    const pp = meCnt>=3 || meObl>=2_000_000 ? 5 : meCnt>=1 ? 3 : 1
+
+    // Staffing proxy 1–5 (how “big” the typical award is here)
+    let staffing = 3
+    if (P.p50) {
+      const contractSize = toNum(A.obligated||A.ceiling||0)
+      staffing = contractSize <= P.p50 ? 5 : (contractSize <= (P.p75||P.p50) ? 4 : 2)
+    }
+
+    // Schedule risk 1–5
+    let sched = 3
+    if (daysToEnd!=null && burn!=null) {
+      if (daysToEnd>180 && burn<70) sched=5
+      else if (daysToEnd<60 || burn>90) sched=2
+      else sched=3
+    }
+
+    // Compliance 1–5 (set-aside tendency vs my socio)
+    const knownSA = toNum(setAside.rows[0]?.known)
+    const totalSA = toNum(setAside.rows[0]?.total)
+    const example = (setAside.rows[0]?.example_set_aside||"").toUpperCase()
+    const haveMatch = (tag:string)=> mySocio.some(s=> s.toUpperCase().includes(tag))
+    let comp = 3
+    if (knownSA>0) {
+      if (example.includes("SDVOSB") && haveMatch("SDVOSB")) comp=5
+      else if (example.includes("WOSB") && haveMatch("WOSB")) comp=5
+      else if (example.includes("HUB") && haveMatch("HUB")) comp=5
+      else if (example.includes("8(A)") && (haveMatch("8(A)")||haveMatch("8A"))) comp=5
+      else comp=2
+    }
+
+    // Price competitiveness 1–5 by percentile bucket
+    let price = 3
+    if (P.p25 && P.p50 && P.p75) {
+      const val = toNum(A.obligated||A.ceiling||0)
+      if (val<=P.p25) price=4
+      else if (val<=P.p50) price=5
+      else if (val<=P.p75) price=3
+      else price=2
+    }
+
+    // Customer intimacy 1–5
+    const intimacy = meCnt>=3 ? 5 : meCnt===2 ? 4 : meCnt===1 ? 3 : 1
+
+    // Competitive Intel 1–5 (strong incumbent -> lower score)
+    const compIntel = incCnt===0 ? 5 : incCnt<=2 ? 4 : incCnt<=5 ? 3 : 2
+
+    // Weighted %
+    const W = { tech:24, pp:20, staff:12, sched:8, compliance:8, price:8, intimacy:10, intel:10 }
+    const pct = ( (W.tech*(tech/5)) + (W.pp*(pp/5)) + (W.staff*(staff/5)) + (W.sched*(sched/5)) +
+                  (W.compliance*(comp/5)) + (W.price*(price/5)) + (W.intimacy*(intimacy/5)) + (W.intel*(compIntel/5)) ) / 100 * 100
+    const weighted = Math.round(pct*10)/10
+    const decision = weighted>=80 ? "bid" : (weighted>=65 ? "conditional" : "no_bid")
+
+    // Heat map + “how to raise score”
+    const heat = [
+      { level: incCnt>5 ? "High":"Med-High", reason: `Incumbent has ${incCnt} awards / $${Math.round(incObl).toLocaleString()} at ${orgName}` },
+      { level: myNAICS.includes(naics) ? "Low":"Med-High", reason: myNAICS.includes(naics) ? "Exact NAICS match" : "No exact NAICS in SAM" },
+      { level: meCnt>0 ? "Medium":"High", reason: meCnt>0 ? `You have ${meCnt} awards at this org` : "No awards at this org" },
+    ]
+    const improve:string[] = []
+    if (!myNAICS.includes(naics)) improve.push(`Add NAICS ${naics} to SAM (or team with a prime holding it).`)
+    if (meCnt===0) improve.push(`Pursue micro-tasking/teaming at ${orgName} to build a reference quickly.`)
+    if (knownSA>0 && comp<5) improve.push(`Align socio-economic category with prior set-aside pattern (${example || "varied"}).`)
+    if ((P.p50||0)>0 && (toNum(A.obligated||A.ceiling||0)>(P.p75||P.p50))) improve.push("Propose lean staffing/price to land below local median.")
+
+    return new Response(JSON.stringify({
+      ok:true,
+      inputs:{ piid, uei, org:orgName, naics },
+      criteria:[
+        { name:"Technical Fit", weight:24, score:tech, reason: myNAICS.includes(naics) ? "Exact NAICS match" : myNAICS.some(c=>c?.slice(0,3)===String(naics).slice(0,3)) ? "Related NAICS family" : "No NAICS match" },
+        { name:"Relevant Experience / Past Performance", weight:20, score:pp, reason:`Your awards at this org: ${meCnt}; $${Math.round(meObl).toLocaleString()}` },
+        { name:"Staffing & Key Personnel", weight:12, score:staffing, reason:"Proxy via local award size distribution" },
+        { name:"Schedule / ATO Timeline Risk", weight:8, score:sched, reason:`Days to end: ${daysToEnd ?? "unknown"}; burn: ${burn ?? "unknown"}%` },
+        { name:"Compliance", weight:8, score:comp, reason: knownSA? `Historic set-aside pattern: ${example||"varied"}`:"Set-aside unknown" },
+        { name:"Price Competitiveness", weight:8, score:price, reason:"Position vs NAICS@org percentiles" },
+        { name:"Customer Intimacy", weight:10, score:intimacy, reason:`Your awards at this org: ${meCnt}` },
+        { name:"Competitive Intelligence", weight:10, score:compIntel, reason:`Incumbent awards: ${incCnt}` },
+      ],
+      weighted_percent: weighted,
+      decision,
+      heatmap: heat,
+      improve_now: improve
+    }), { status:200, headers:{ ...headers, "Content-Type":"application/json" }})
+  } catch (e:any) {
+    try { await client.end() } catch {}
+    return new Response(JSON.stringify({ ok:false, error:e?.message||"bid-nobid failed" }),
+      { status:500, headers:{ ...headers, "Content-Type":"application/json" }})
+  } finally {
+    try { await client.end() } catch {}
+  }
+}
+    /* =============================================================
+ * One-click Bid/No-Bid memo
+ *    GET /sb/bid-nobid-memo?piid=HC102825F0042&uei=MKA4F1KQSSB5&years=5
+ * Uses the existing /sb/bid-nobid route for scoring, then asks
+ * OpenAI to write a concise memo. Returns JSON:
+ * { ok, decision, weighted_percent, criteria:[...], memo, inputs:{...} }
+ * =========================================================== */
+if (last === "bid-nobid-memo") {
+  const piid  = (url.searchParams.get("piid") || "").trim().toUpperCase()
+  const uei   = (url.searchParams.get("uei")  || "").trim().toUpperCase()
+  const years = (url.searchParams.get("years")|| "5").trim()
+  if (!piid || !uei) {
+    return new Response(JSON.stringify({ ok:false, error:"Missing piid or uei" }), {
+      status: 400, headers: { ...headers, "Content-Type":"application/json" }
+    })
+  }
+
+  // 1) Call our internal scorer
+  const bnbURL = new URL(request.url)
+  bnbURL.pathname = "/sb/bid-nobid"
+  bnbURL.search = `?piid=${encodeURIComponent(piid)}&uei=${encodeURIComponent(uei)}&years=${encodeURIComponent(years)}`
+  const bnbRes = await fetch(bnbURL.toString(), { headers: { "Accept":"application/json" } })
+  const bnbTxt = await bnbRes.text()
+  let bnb: any = {}
+  try { bnb = bnbTxt ? JSON.parse(bnbTxt) : {} } catch { /* keep as {} */ }
+  if (!bnbRes.ok || bnb?.ok === false) {
+    return new Response(JSON.stringify({ ok:false, error: bnb?.error || "bid-nobid failed" }), {
+      status: 500, headers: { ...headers, "Content-Type":"application/json" }
+    })
+  }
+
+  if (!env.OPENAI_API_KEY) {
+    return new Response(JSON.stringify({ ok:false, error:"OPENAI_API_KEY not set" }), {
+      status: 500, headers: { ...headers, "Content-Type":"application/json" }
+    })
+  }
+
+  // 2) Build compact prompt from the scored matrix
+  const matrixLines = (bnb.criteria || []).map((c:any) =>
+    `${c.name} | weight ${c.weight}% | score ${c.score}/5 | ${c.reason || ""}`.trim()
+  ).join("\n")
+
+  const prompt = `
+You are the Bid/No-Bid Decision GPT for federal capture. Use the scored matrix below to produce:
+1) A decision (Bid / Conditional / No-Bid) with percent.
+2) A 5–7 line executive memo referencing the actual numbers (NAICS match, org history $, socio-econ vs set-aside, incumbent strength, schedule/burn, price percentile).
+3) A 5-line risk heat map (emojis only: 🟢🟡🟠🔴).
+4) A 10–14 day capture plan (bullets).
+5) 6–10 precise CO questions.
+
+Inputs:
+- PIID: ${bnb?.inputs?.piid || piid}
+- Org: ${bnb?.inputs?.org || "—"}
+- NAICS: ${bnb?.inputs?.naics || "—"}
+- Decision: ${bnb?.decision || "—"} (${bnb?.weighted_percent ?? "—"}%)
+
+Matrix:
+${matrixLines}
+
+Keep it concise and specific—no fluff.
+  `.trim()
+
+  const aiRes = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type":"application/json",
+      "Authorization":`Bearer ${env.OPENAI_API_KEY}`
+    },
+    body: JSON.stringify({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: "You are a federal capture strategist." },
+        { role: "user", content: prompt }
+      ],
+      temperature: 0.3,
+      max_tokens: 900
+    })
+  })
+
+  const aiTxt = await aiRes.text()
+  let memo = ""
+  try { memo = JSON.parse(aiTxt).choices?.[0]?.message?.content?.trim() || "" }
+  catch { memo = aiTxt.slice(0, 3000) } // graceful fallback if non-JSON
+
+  return new Response(JSON.stringify({ ok:true, ...bnb, memo }), {
+    status: 200, headers: { ...headers, "Content-Type":"application/json" }
+  })
+}
+    
     // Fallback
     return new Response("Not found", { status: 404, headers })
   },
