@@ -1,4 +1,4 @@
-// worker.js — sb-analytics
+// worker.js — sb-analytics (updated)
 import { Client } from "pg"
 
 // ---------- CORS helper ----------
@@ -20,9 +20,17 @@ function cors(origin, env) {
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
     "Access-Control-Max-Age": "86400",
+    // Default = no-store; we override per-route where we want caching
     "Cache-Control": "no-store",
     Vary: "Origin",
   }
+}
+
+// Helper to re-attach CORS headers to cached responses
+function withCors(res, headers) {
+  const h = new Headers(res.headers)
+  for (const [k, v] of Object.entries(headers || {})) h.set(k, v)
+  return new Response(res.body, { status: res.status, headers: h })
 }
 
 // ---------- DB client via Hyperdrive ----------
@@ -65,6 +73,36 @@ const COL = {
 }
 /* ================================================================= */
 
+// --- SAM entity website lookup (optional) ---
+async function fetchVendorWebsiteByUEI(uei, env) {
+  const key = env.SAM_API_KEY
+  if (!key || !uei) return null
+  try {
+    const u = new URL("https://api.sam.gov/entity-information/v2/entities")
+    u.searchParams.set("ueiSAM", uei)
+    u.searchParams.set("api_key", key)
+
+    // Cache aggressively at the edge (entity data is fairly static)
+    const r = await fetch(u.toString(), {
+      cf: { cacheTtl: 86400, cacheEverything: true },
+    })
+    if (!r.ok) return null
+    const j = await r.json()
+
+    // Try common shapes
+    const ent = j?.entityRegistration || j?.entities?.[0] || j?.results?.[0]
+    const website =
+      ent?.coreData?.businessInformation?.url ||
+      ent?.coreData?.generalInformation?.corporateUrl ||
+      ent?.coreData?.generalInformation?.url ||
+      null
+
+    return website && typeof website === "string" ? website.trim() : null
+  } catch {
+    return null
+  }
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url)
@@ -77,17 +115,11 @@ export default {
     }
 
     // ---------- Normalize path segments ----------
-    // Works for:
-    //   /sb/expiring-contracts
-    //   /prod/sb/expiring-contracts
-    //   /sb/contracts/insights
-    //   /sb/agencies
     const segments = url.pathname.split("/").filter(Boolean)
     const last = segments[segments.length - 1] || ""
     const secondLast = segments.length > 1 ? segments[segments.length - 2] : ""
 
     // ---------- Health ----------
-    // e.g. GET /sb/health
     if (last === "health") {
       return new Response(JSON.stringify({ ok: true, db: true }), {
         status: 200,
@@ -99,8 +131,23 @@ export default {
      * 0) Agencies list (for dropdown / datalist)
      *    GET /sb/agencies
      *    Returns top-level + sub-agencies + offices
+     *    (now cached at edge for 24h)
      * =========================================================== */
     if (last === "agencies") {
+      // Edge cache first
+      const cache = caches.default
+      const cacheKey = new Request(url.toString(), request)
+      const cached = await cache.match(cacheKey)
+      if (cached) {
+        return withCors(
+          cached,
+          {
+            ...headers,
+            "Cache-Control": "public, s-maxage=86400, stale-while-revalidate=604800",
+          },
+        )
+      }
+
       const client = makeClient(env)
       try {
         await client.connect()
@@ -129,37 +176,34 @@ export default {
         `
         const { rows } = await client.query(sql)
 
-        return new Response(JSON.stringify({ ok: true, rows }), {
+        const res = new Response(JSON.stringify({ ok: true, rows }), {
           status: 200,
-          headers: { ...headers, "Content-Type": "application/json" },
+          headers: {
+            ...headers,
+            "Content-Type": "application/json",
+            "Cache-Control": "public, s-maxage=86400, stale-while-revalidate=604800",
+          },
         })
+        ctx.waitUntil(cache.put(cacheKey, res.clone()))
+        return res
       } catch (e) {
-        try {
-          await client.end()
-        } catch {}
+        try { await client.end() } catch {}
         return new Response(
           JSON.stringify({ ok: false, error: e?.message || "query failed" }),
           { status: 500, headers: { ...headers, "Content-Type": "application/json" } },
         )
       } finally {
-        try {
-          await client.end()
-        } catch {}
+        try { await client.end() } catch {}
       }
     }
 
     /* =============================================================
      * 1) SB Agency Share (existing)
      *    GET /sb/agency-share?fy=2026&limit=12
-     *    (or any route whose last segment is `agency-share`)
      * =========================================================== */
     if (last === "agency-share") {
       const fy = parseInt(url.searchParams.get("fy") || "2026", 10)
-      const limit = Math.max(
-        1,
-        Math.min(50, parseInt(url.searchParams.get("limit") || "12", 10)),
-      )
-
+      const limit = Math.max(1, Math.min(50, parseInt(url.searchParams.get("limit") || "12", 10)))
       const client = makeClient(env)
 
       try {
@@ -176,14 +220,8 @@ export default {
 
         const data = rows.map((r) => ({
           agency: r.agency,
-          sb_share_pct:
-            typeof r.sb_share_pct === "number"
-              ? r.sb_share_pct
-              : Number(r.sb_share_pct),
-          dollars_total:
-            typeof r.dollars_total === "number"
-              ? r.dollars_total
-              : Number(r.dollars_total),
+          sb_share_pct: typeof r.sb_share_pct === "number" ? r.sb_share_pct : Number(r.sb_share_pct),
+          dollars_total: typeof r.dollars_total === "number" ? r.dollars_total : Number(r.dollars_total),
         }))
 
         return new Response(JSON.stringify({ ok: true, rows: data }), {
@@ -191,41 +229,17 @@ export default {
           headers: { ...headers, "Content-Type": "application/json" },
         })
       } catch (e) {
-        try {
-          await client.end()
-        } catch {}
-        return new Response(
-          JSON.stringify({ ok: false, error: e?.message || "query failed" }),
-          {
-            status: 500,
-            headers: { ...headers, "Content-Type": "application/json" },
-          },
-        )
+        try { await client.end() } catch {}
+        return new Response(JSON.stringify({ ok: false, error: e?.message || "query failed" }), {
+          status: 500,
+          headers: { ...headers, "Content-Type": "application/json" },
+        })
       }
     }
 
     /* =============================================================
      * Vendor–Agency summary
      *    GET /sb/vendor-summary?uei=XXXX&agency=Dept%20of%20Defense
-     *
-     *  - uei   (required): recipient UEI
-     *  - agency (optional): matches agency / sub-agency / office
-     *    using the same equality logic as expiring-contracts.
-     *
-     *  Returns:
-     *    {
-     *      ok: true,
-     *      vendor: { uei, name },
-     *      agencyFilter: string | null,
-     *      totals: {
-     *        awards: number,
-     *        obligated: number,
-     *        ceiling: number
-     *      },
-     *      byYear: [
-     *        { fiscalYear, awards, obligated, ceiling }
-     *      ]
-     *    }
      * =========================================================== */
     if (last === "vendor-summary") {
       const uei = (url.searchParams.get("uei") || "").trim()
@@ -239,11 +253,9 @@ export default {
       }
 
       const client = makeClient(env)
-
       try {
         await client.connect()
 
-        // 1) Basic vendor name (best-effort – just grab one row)
         const vendorSql = `
           SELECT recipient_name
           FROM ${USA_TABLE}
@@ -254,9 +266,6 @@ export default {
         const vendorRes = await client.query(vendorSql, [uei])
         const vendorName = vendorRes.rows[0]?.recipient_name || null
 
-        // 2) Totals + yearly breakdown
-        // NOTE: this assumes a "fiscal_year" column exists on your view.
-        // If your view uses a different year column, swap it in here.
         const summarySql = `
           SELECT
             fiscal_year,
@@ -274,22 +283,13 @@ export default {
           GROUP BY fiscal_year
           ORDER BY fiscal_year DESC
         `
-        const summaryRes = await client.query(summarySql, [
-          uei,
-          agencyFilter || null,
-        ])
+        const summaryRes = await client.query(summarySql, [uei, agencyFilter || null])
 
         const byYear = (summaryRes.rows || []).map((r) => ({
           fiscalYear: r.fiscal_year,
           awards: Number(r.awards || 0),
-          obligated:
-            typeof r.obligated === "number"
-              ? r.obligated
-              : Number(r.obligated || 0),
-          ceiling:
-            typeof r.ceiling === "number"
-              ? r.ceiling
-              : Number(r.ceiling || 0),
+          obligated: typeof r.obligated === "number" ? r.obligated : Number(r.obligated || 0),
+          ceiling: typeof r.ceiling === "number" ? r.ceiling : Number(r.ceiling || 0),
         }))
 
         const totals = byYear.reduce(
@@ -313,57 +313,53 @@ export default {
           { status: 200, headers: { ...headers, "Content-Type": "application/json" } },
         )
       } catch (e) {
-        try {
-          await client.end()
-        } catch {}
-        return new Response(
-          JSON.stringify({ ok: false, error: e?.message || "query failed" }),
-          {
-            status: 500,
-            headers: { ...headers, "Content-Type": "application/json" },
-          },
-        )
+        try { await client.end() } catch {}
+        return new Response(JSON.stringify({ ok: false, error: e?.message || "query failed" }), {
+          status: 500,
+          headers: { ...headers, "Content-Type": "application/json" },
+        })
       } finally {
-        try {
-          await client.end()
-        } catch {}
+        try { await client.end() } catch {}
       }
     }
 
-    
     /* =============================================================
      * 2) Expiring Contracts (Neon-backed)
      *    GET /sb/expiring-contracts?naics=541519&agency=VA&window_days=180&limit=50
-     *    (or any route whose last segment is `expiring-contracts`)
-     *
-     *    IMPORTANT: agency filter now uses *exact* matches against
-     *    agency / sub-agency / office names to avoid slow `%...%`
-     *    scans and timeouts.
+     *    Equality match for agency/sub/office (no contains scans).
+     *    Now uses edge caching for 5 minutes.
      * =========================================================== */
     if (last === "expiring-contracts") {
       const naicsParam = (url.searchParams.get("naics") || "").trim()
       const agencyFilter = (url.searchParams.get("agency") || "").trim()
-      const windowDays = Math.max(
-        1,
-        Math.min(365, parseInt(url.searchParams.get("window_days") || "180", 10)),
-      )
-      const limit = Math.max(
-        1,
-        Math.min(200, parseInt(url.searchParams.get("limit") || "100", 10)),
-      )
+      const windowDays = Math.max(1, Math.min(365, parseInt(url.searchParams.get("window_days") || "180", 10)))
+      const limit = Math.max(1, Math.min(200, parseInt(url.searchParams.get("limit") || "100", 10)))
 
       const naicsList =
         naicsParam.length > 0
-          ? naicsParam
-              .split(",")
-              .map((s) => s.trim())
-              .filter(Boolean)
+          ? naicsParam.split(",").map((s) => s.trim()).filter(Boolean)
           : []
 
-      const client = makeClient(env)
+      // Edge cache first (key = full URL)
+      const cache = caches.default
+      const cacheKey = new Request(url.toString(), request)
+      const cached = await cache.match(cacheKey)
+      if (cached) {
+        return withCors(
+          cached,
+          {
+            ...headers,
+            "Cache-Control": "public, s-maxage=300, stale-while-revalidate=86400",
+          },
+        )
+      }
 
+      const client = makeClient(env)
       try {
         await client.connect()
+
+        // Optional: keep very long scans from locking the request
+        try { await client.query("SET statement_timeout = '55s'") } catch {}
 
         const sql = `
           SELECT
@@ -379,9 +375,9 @@ export default {
             AND ${COL.END_DATE} < CURRENT_DATE + $1::int
             AND (
               $2::text IS NULL
-              OR ${COL.AGENCY}      = $2
-              OR ${COL.SUB_AGENCY}  = $2
-              OR awarding_office_name = $2
+              OR ${COL.AGENCY}            = $2
+              OR ${COL.SUB_AGENCY}        = $2
+              OR awarding_office_name     = $2
             )
             AND (
               $3::text[] IS NULL
@@ -390,14 +386,7 @@ export default {
           ORDER BY ${COL.END_DATE} ASC
           LIMIT $4
         `
-
-        const params = [
-          windowDays, // $1
-          agencyFilter || null, // $2
-          naicsList.length ? naicsList : null, // $3
-          limit, // $4
-        ]
-
+        const params = [windowDays, agencyFilter || null, naicsList.length ? naicsList : null, limit]
         const { rows } = await client.query(sql, params)
         ctx.waitUntil(client.end())
 
@@ -407,50 +396,37 @@ export default {
           agency: r.agency,
           naics: r.naics,
           end_date: r.end_date,
-          // potential_total_value_of_award_num already chosen in COL.VALUE
-          value:
-            typeof r.value === "number"
-              ? r.value
-              : Number(r.value ?? null),
+          value: typeof r.value === "number" ? r.value : Number(r.value ?? null),
         }))
 
-        return new Response(JSON.stringify({ ok: true, rows: data }), {
+        const res = new Response(JSON.stringify({ ok: true, rows: data }), {
           status: 200,
+          headers: {
+            ...headers,
+            "Content-Type": "application/json",
+            "Cache-Control": "public, s-maxage=300, stale-while-revalidate=86400",
+          },
+        })
+        ctx.waitUntil(cache.put(cacheKey, res.clone()))
+        return res
+      } catch (e) {
+        try { await client.end() } catch {}
+        return new Response(JSON.stringify({ ok: false, error: e?.message || "query failed" }), {
+          status: 500,
           headers: { ...headers, "Content-Type": "application/json" },
         })
-      } catch (e) {
-        try {
-          await client.end()
-        } catch {}
-        return new Response(
-          JSON.stringify({ ok: false, error: e?.message || "query failed" }),
-          {
-            status: 500,
-            headers: { ...headers, "Content-Type": "application/json" },
-          },
-        )
       }
     }
 
     /* =============================================================
      * 3) Contract insights (AI + subcontracts)
      *    POST /sb/contracts/insights  { piid: "HC102825F0042" }
-     *    Matches any path that ends with "/contracts/insights"
-     *
-     *    - Pulls core award data from usaspending_awards_v1
-     *    - Pulls subcontract data from usaspending_contract_subawards
-     *    - Computes lifecycle & burn in code so AI can’t contradict it
+     *    Enriched with vendor website via SAM (if SAM_API_KEY is set)
      * =========================================================== */
-    if (
-      request.method === "POST" &&
-      url.pathname.toLowerCase().endsWith("/contracts/insights")
-    ) {
+    if (request.method === "POST" && url.pathname.toLowerCase().endsWith("/contracts/insights")) {
       if (!env.OPENAI_API_KEY) {
         return new Response(
-          JSON.stringify({
-            ok: false,
-            error: "OPENAI_API_KEY is not configured for sb-analytics.",
-          }),
+          JSON.stringify({ ok: false, error: "OPENAI_API_KEY is not configured for sb-analytics." }),
           { status: 500, headers: { ...headers, "Content-Type": "application/json" } },
         )
       }
@@ -460,10 +436,9 @@ export default {
         const body = await request.json().catch(() => ({}))
         const piid = String(body.piid || "").trim().toUpperCase()
         if (!piid) {
-          return new Response(
-            JSON.stringify({ ok: false, error: "Missing piid" }),
-            { status: 400, headers: { ...headers, "Content-Type": "application/json" } },
-          )
+          return new Response(JSON.stringify({ ok: false, error: "Missing piid" }), {
+            status: 400, headers: { ...headers, "Content-Type": "application/json" },
+          })
         }
 
         await client.connect()
@@ -491,35 +466,27 @@ export default {
           LIMIT 1
         `
         const awardRes = await client.query(awardSql, [piid])
-
         if (!awardRes.rows.length) {
-          return new Response(
-            JSON.stringify({ ok: false, error: "No award found for that PIID." }),
-            { status: 404, headers: { ...headers, "Content-Type": "application/json" } },
-          )
+          return new Response(JSON.stringify({ ok: false, error: "No award found for that PIID." }), {
+            status: 404, headers: { ...headers, "Content-Type": "application/json" },
+          })
         }
 
         const a = awardRes.rows[0]
-
-        const toNumber = (x) =>
-          typeof x === "number" ? x : x == null ? null : Number(x)
+        const toNumber = (x) => (typeof x === "number" ? x : x == null ? null : Number(x))
 
         const obligated = toNumber(a.total_dollars_obligated_num) ?? 0
         const currentValue =
           toNumber(a.current_total_value_of_award_num) ??
-          toNumber(a.potential_total_value_of_award_num) ??
-          0
+          toNumber(a.potential_total_value_of_award_num) ?? 0
         const ceiling = toNumber(a.potential_total_value_of_award_num) ?? currentValue
 
-        // ---- 3b. Lifecycle and window in code ----
+        // ---- 3b. Lifecycle and window ----
         const today = new Date()
-
         const parseDate = (d) => (d ? new Date(d) : null)
         const startDate = parseDate(a.pop_start_date)
         const currentEnd = parseDate(a.pop_current_end_date)
         const potentialEnd = parseDate(a.pop_potential_end_date)
-
-        // Use potential end if available, otherwise current end
         const endForLifecycle = potentialEnd || currentEnd
 
         let lifecycleStage = "unknown"
@@ -530,33 +497,20 @@ export default {
 
         if (startDate && endForLifecycle && endForLifecycle > startDate) {
           const totalMs = endForLifecycle.getTime() - startDate.getTime()
-          const clampedNow = Math.min(
-            Math.max(today.getTime(), startDate.getTime()),
-            endForLifecycle.getTime(),
-          )
+          const clampedNow = Math.min(Math.max(today.getTime(), startDate.getTime()), endForLifecycle.getTime())
           const elapsedMs = clampedNow - startDate.getTime()
           timeElapsedPct = Math.round((elapsedMs / totalMs) * 100)
 
           if (today < startDate) {
-            lifecycleStage = "not_started"
-            lifecycleLabel = "Not started yet"
-            windowLabel = "Window not opened"
+            lifecycleStage = "not_started"; lifecycleLabel = "Not started yet"; windowLabel = "Window not opened"
           } else if (today > endForLifecycle) {
-            lifecycleStage = "complete"
-            lifecycleLabel = "Performance complete"
-            windowLabel = "Window passed"
+            lifecycleStage = "complete"; lifecycleLabel = "Performance complete"; windowLabel = "Window passed"
           } else if (timeElapsedPct < 25) {
-            lifecycleStage = "early"
-            lifecycleLabel = "Early stage"
-            windowLabel = "In performance window"
+            lifecycleStage = "early"; lifecycleLabel = "Early stage"; windowLabel = "In performance window"
           } else if (timeElapsedPct < 75) {
-            lifecycleStage = "mid"
-            lifecycleLabel = "Mid-stage"
-            windowLabel = "In performance window"
+            lifecycleStage = "mid"; lifecycleLabel = "Mid-stage"; windowLabel = "In performance window"
           } else {
-            lifecycleStage = "late"
-            lifecycleLabel = "Late / near end"
-            windowLabel = "In performance window"
+            lifecycleStage = "late"; lifecycleLabel = "Late / near end"; windowLabel = "In performance window"
           }
         }
 
@@ -564,19 +518,15 @@ export default {
           burnPct = Math.round((obligated / ceiling) * 100)
         }
 
-        // ---- 3c. Subcontracts for this PIID ----
+        // ---- 3c. Subcontracts ----
         const subsSql = `
-          SELECT
-            subawardee_name,
-            subawardee_uei,
-            subaward_amount
+          SELECT subawardee_name, subawardee_uei, subaward_amount
           FROM public.usaspending_contract_subawards
           WHERE prime_award_piid = $1
         `
         const subsRes = await client.query(subsSql, [piid])
         const subsRaw = subsRes.rows || []
 
-        // Aggregate by (name, uei)
         const subMap = new Map()
         for (const row of subsRaw) {
           const name = row.subawardee_name || "(Unnamed subrecipient)"
@@ -587,27 +537,18 @@ export default {
           prev.amount += amt
           subMap.set(key, prev)
         }
-
-        const subsAgg = Array.from(subMap.values())
-        subsAgg.sort((a, b) => (b.amount || 0) - (a.amount || 0))
-
+        const subsAgg = Array.from(subMap.values()).sort((a, b) => (b.amount || 0) - (a.amount || 0))
         const subCount = subsRaw.length
         const distinctRecipients = subsAgg.length
         const totalSubAmount = subsAgg.reduce((sum, s) => sum + (s.amount || 0), 0)
-
         const topSubs = subsAgg.slice(0, 5)
 
         let primeVsSubsPct = null
         let largestSubPct = null
-
         if (obligated > 0 && totalSubAmount > 0) {
           const subPct = Math.min(100, (totalSubAmount / obligated) * 100)
-          primeVsSubsPct = {
-            prime: Math.round(100 - subPct),
-            subs: Math.round(subPct),
-          }
+          primeVsSubsPct = { prime: Math.round(100 - subPct), subs: Math.round(subPct) }
         }
-
         if (totalSubAmount > 0 && topSubs.length > 0) {
           largestSubPct = Math.round((topSubs[0].amount / totalSubAmount) * 100)
         }
@@ -615,7 +556,7 @@ export default {
         const disclaimer =
           "Subcontractor data is sourced from USAspending. Primes are not required to report every subcontract, so this list may be incomplete."
 
-        // ---- 3d. Build structured context for the UI ----
+        // ---- 3d. Primary block ----
         const primary = {
           piid: a.award_id_piid,
           agency: a.awarding_agency_name || null,
@@ -632,6 +573,10 @@ export default {
           currentValue,
           ceiling,
         }
+
+        // Enrich with website (optional)
+        const website = await fetchVendorWebsiteByUEI(primary.primeUei, env)
+        if (website) primary.website = website
 
         const lifecycle = {
           stage: lifecycleStage,
@@ -650,15 +595,13 @@ export default {
           top: topSubs,
         }
 
-        // ---- 3e. AI summary (uses lifecycle + subs, but doesn't own them) ----
+        // ---- 3e. AI summary ----
         const burnText =
           burnPct == null
             ? "Burn vs. ceiling could not be determined."
             : `Approximately ${burnPct}% of the contract ceiling is obligated (≈$${Math.round(
                 obligated,
-              ).toLocaleString("en-US")} of ≈$${Math.round(
-                ceiling,
-              ).toLocaleString("en-US")}).`
+              ).toLocaleString("en-US")} of ≈$${Math.round(ceiling).toLocaleString("en-US")}).`
 
         const lifecycleText =
           lifecycleStage === "not_started"
@@ -688,7 +631,7 @@ export default {
                 .map((s) => `${s.name} (UEI ${s.uei || "unknown"})`)
                 .join(", ")}.`
 
-                const prompt = `
+        const prompt = `
 You are helping a small federal contractor quickly understand a single contract and how to position for a recompete or subcontracting role.
 
 Treat the lifecycle, burn %, and subcontracting figures below as correct. Do not contradict them.
@@ -697,44 +640,24 @@ Contract snapshot:
 - PIID: ${primary.piid}
 - Awarding agency: ${primary.agency || "—"}
 - Component / office: ${primary.subAgency || "—"} / ${primary.office || "—"}
-- Prime: ${primary.primeName || "—"} (UEI: ${primary.primeUei || "unknown"})
+- Prime: ${primary.primeName || "—"} (UEI: ${primary.primeUei || "unknown"})${website ? ` — Website: ${website}` : ""}
 - NAICS: ${primary.naicsCode || "—"} – ${primary.naicsDescription || "—"}
-- Period of performance: ${primary.popStartDate || "—"} to ${
-          primary.popCurrentEndDate || "—"
-        } (potential: ${primary.popPotentialEndDate || "—"})
-- Lifecycle stage: ${lifecycleStage} (${lifecycle.label}, time elapsed ≈${
-          timeElapsedPct == null ? "unknown" : timeElapsedPct + "%"
-        })
-- Burn vs ceiling: ${burnText}
+- Period of performance: ${primary.popStartDate || "—"} to ${primary.popCurrentEndDate || "—"} (potential: ${primary.popPotentialEndDate || "—"})
+- Lifecycle stage: ${lifecycleStage} (${lifecycle.label}, time elapsed ≈${timeElapsedPct == null ? "unknown" : timeElapsedPct + "%"})
+- ${burnText}
 - Subcontracting footprint: ${subsText} ${topSubText}
 
-Write 4–5 bullet points that are tailored to the current lifecycle stage:
-
-- If stage is NOT_STARTED: focus on pre-award shaping, early outreach, and building past performance.
-- If stage is EARLY or MID: focus on influencing future options/task orders and monitoring burn vs ceiling.
-- If stage is LATE or COMPLETE: focus on recompete timing, positioning, and teaming strategies.
-- Always explain what burn % and subcontracting patterns mean in plain language.
-- Recommend concrete next actions: which offices, primes, or named subs to talk to; what to research; and roughly when (in months) to act relative to the likely recompete window.
-
-Avoid generic advice like "build relationships" unless you tie it specifically to the agency, office, prime, or named subs above.
+Write 4–5 bullet points that are tailored to the current lifecycle stage.
 Keep it under 180 words, concise, and non-technical.
         `.trim()
-        
 
         const aiRes = await fetch("https://api.openai.com/v1/chat/completions", {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${env.OPENAI_API_KEY}`,
-          },
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${env.OPENAI_API_KEY}` },
           body: JSON.stringify({
             model: "gpt-4.1-mini",
             messages: [
-              {
-                role: "system",
-                content:
-                  "You are a federal contracts analyst helping small businesses interpret USAspending and subcontract data.",
-              },
+              { role: "system", content: "You are a federal contracts analyst helping small businesses interpret USAspending and subcontract data." },
               { role: "user", content: prompt },
             ],
             max_tokens: 400,
@@ -743,36 +666,21 @@ Keep it under 180 words, concise, and non-technical.
 
         const aiText = await aiRes.text()
         let aiJson = {}
-        try {
-          aiJson = aiText ? JSON.parse(aiText) : {}
-        } catch {
+        try { aiJson = aiText ? JSON.parse(aiText) : {} } catch {
           throw new Error("AI response was not valid JSON: " + aiText.slice(0, 160))
         }
-
-        const summary =
-          aiJson.choices?.[0]?.message?.content?.trim() ||
-          "AI produced no summary."
+        const summary = aiJson.choices?.[0]?.message?.content?.trim() || "AI produced no summary."
 
         return new Response(
-          JSON.stringify({
-            ok: true,
-            summary,
-            primary,
-            lifecycle,
-            subs,
-            disclaimer,
-          }),
+          JSON.stringify({ ok: true, summary, primary, lifecycle, subs, disclaimer }),
           { status: 200, headers: { ...headers, "Content-Type": "application/json" } },
         )
       } catch (e) {
-        return new Response(
-          JSON.stringify({ ok: false, error: e?.message || "AI insight failed" }),
-          { status: 500, headers: { ...headers, "Content-Type": "application/json" } },
-        )
+        return new Response(JSON.stringify({ ok: false, error: e?.message || "AI insight failed" }), {
+          status: 500, headers: { ...headers, "Content-Type": "application/json" },
+        })
       } finally {
-        try {
-          await client.end()
-        } catch {}
+        try { await client.end() } catch {}
       }
     }
 
