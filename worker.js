@@ -391,6 +391,77 @@ if (last === "my-entity") {
     })
   }
 }
+/* =============================================================
+ * /sb/my-entity?uei=XXXX — merge SAM Entity + Registration
+ * For Fit Score and showing your own company profile
+ * =========================================================== */
+if (last === "my-entity") {
+  const uei = (url.searchParams.get("uei") || "").trim()
+  if (!uei) {
+    return new Response(JSON.stringify({ ok:false, error:"Missing uei" }), {
+      status: 400, headers: { ...headers, "Content-Type":"application/json" },
+    })
+  }
+  try {
+    const base = env.SAM_BASE || "https://api.sam.gov"
+    const key  = env.SAM_API_KEY || ""
+
+    const eURL = new URL(`${base}/entity-information/v2/entities`)
+    eURL.searchParams.set("ueiSAM", uei)
+    if (key) eURL.searchParams.set("api_key", key)
+    const r1 = await fetch(eURL.toString())
+    const j1 = await r1.json().catch(()=> ({}))
+
+    const regURL = new URL(`${base}/entity-information/v2/registrations`)
+    regURL.searchParams.set("ueiSAM", uei)
+    if (key) regURL.searchParams.set("api_key", key)
+    const r2 = await fetch(regURL.toString())
+    const j2 = await r2.json().catch(()=> ({}))
+
+    const ent  = j1?.entityList?.[0] || j1?.entities?.[0] || j1?.entity || {}
+    const reg  = j2?.entityRegistration || j2?.registrations?.[0] || {}
+
+    const name =
+      ent?.legalBusinessName ||
+      reg?.coreData?.generalInformation?.legalBusinessName || null
+
+    const website =
+      reg?.coreData?.businessInformation?.url ||
+      ent?.corporateUrl || null
+
+    const phys = reg?.coreData?.physicalAddress || {}
+    const naics = Array.from(new Set(
+      ((reg?.assertions?.primaryNAICS || []) as any[])
+        .concat(reg?.assertions?.additionalNAICS || [])
+        .map((x:any) => x?.code || x)
+        .filter(Boolean)
+    ))
+
+    const socio = (reg?.assertions?.socioEconomic?.list || [])
+
+    return new Response(JSON.stringify({
+      ok: true,
+      entity: {
+        uei, name, website,
+        address: {
+          line: phys?.addressLine1 || null,
+          city: phys?.city || null,
+          state: phys?.stateOrProvinceCode || null,
+          zip: phys?.zipCode || null,
+        },
+        naics,
+        socio,
+        registrationStatus: reg?.registrationStatus || null,
+      }
+    }), { status: 200, headers: { ...headers, "Content-Type":"application/json" } })
+  } catch (e) {
+    return new Response(JSON.stringify({ ok:false, error: e?.message || "SAM lookup failed" }), {
+      status: 500, headers: { ...headers, "Content-Type":"application/json" },
+    })
+  }
+}
+    
+    
     /* =============================================================
      * 2) Expiring Contracts (Neon-backed)
      *    GET /sb/expiring-contracts?naics=541519&agency=VA&window_days=180&limit=50
