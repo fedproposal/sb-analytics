@@ -824,7 +824,115 @@ Keep it concise and specific—no fluff.`.trim();
         });
       } finally { try { await client.end(); } catch {} }
     }
+/* ---- SAM.gov raw proxy for your UI ----
+   POST/GET  /opportunities/search
+   Accepts the TSX payload (limit, offset, postedFrom/postedTo, type/noticeTypes,
+   keyword fields, naics*, set-aside, agency fields). Returns the SAM JSON unchanged.
+----------------------------------------------------------------------- */
+function pickQPFromBody(b) {
+  const g = (k, ...alts) => {
+    for (const key of [k, ...alts]) {
+      const v = b?.[key];
+      if (v != null && v !== "") return v;
+    }
+    return undefined;
+  };
 
+  // windowDays from postedFrom/postedTo (MM/DD/YYYY) if provided
+  let windowDays;
+  const postedFrom = g("postedFrom");
+  const postedTo   = g("postedTo");
+  if (postedFrom && postedTo) {
+    const [m1,d1,y1] = String(postedFrom).split("/");
+    const [m2,d2,y2] = String(postedTo).split("/");
+    const from = new Date(`${y1}-${m1}-${d1}`);
+    const to   = new Date(`${y2}-${m2}-${d2}`);
+    const diff = Math.round((to.getTime() - from.getTime())/86400000);
+    if (Number.isFinite(diff) && diff > 0) windowDays = diff;
+  }
+
+  // notice types (array or comma string)
+  let types = g("noticeTypes", "type", "noticeType");
+  if (Array.isArray(types)) types = types.join(",");
+  if (typeof types === "string") {
+    types = types.split(",").map(s => s.trim()).filter(Boolean).join(",");
+  } else {
+    types = "Solicitation"; // default
+  }
+
+  // NAICS (array or string)
+  let naics = g("naics", "naicsCode", "naicsCodes");
+  if (Array.isArray(naics)) naics = naics.join(",");
+  if (typeof naics === "string") {
+    naics = naics.split(/[,\s]+/).map(s => s.replace(/\D+/g,"")).filter(Boolean).join(",");
+  } else {
+    naics = "";
+  }
+
+  const setAside = g("setAside", "setAsideCodes", "typeOfSetAside", "type_of_set_aside");
+  const limit  = parseInt(g("limit") ?? "25", 10);
+  const offset = parseInt(g("offset") ?? "0", 10);
+  const q   = g("q", "keyword", "keywords", "search", "searchText", "searchTerm");
+  const org = g("agency_contains", "agency", "agencyName", "organization", "org", "fullParentPathName");
+
+  return { q, naics, org, setAside, types, limit, offset, windowDays };
+}
+
+function buildSamUrlFromQP(env, qp) {
+  const base = "https://api.sam.gov/prod/opportunities/v2/search";
+  const u = new URL(base);
+  u.searchParams.set("api_key", env.SAM_API_KEY || "");
+
+  // window
+  const days = Math.max(1, Math.min(365, parseInt(qp.windowDays || "15", 10)));
+  const now = new Date();
+  const from = new Date(now.getTime() - days*86400000);
+  const iso = d => d.toISOString().slice(0,10);
+  u.searchParams.set("postedFrom", iso(from));
+  u.searchParams.set("postedTo",   iso(now));
+
+  if (qp.q)     u.searchParams.set("keyword", qp.q);
+  if (qp.naics) qp.naics.split(",").filter(Boolean).forEach(n => u.searchParams.append("naics", n));
+  if (qp.org)   u.searchParams.append("keyword", qp.org); // robust org match
+
+  if (qp.setAside && String(qp.setAside).trim()) {
+    u.searchParams.set("setAsideCode", String(qp.setAside).trim());
+  }
+
+  const types = String(qp.types || "Solicitation")
+    .split(",").map(s=>s.trim()).filter(Boolean);
+  for (const t of types) u.searchParams.append("noticeType", t);
+
+  u.searchParams.set("limit",  String(Math.max(1, Math.min(100, qp.limit || 25))));
+  u.searchParams.set("offset", String(Math.max(0, qp.offset || 0)));
+  u.searchParams.set("sortBy", "modifiedDate");
+  u.searchParams.set("order",  "desc");
+  return u;
+}
+
+if (segments[0] === "opportunities" && last === "search") {
+  if (!env.SAM_API_KEY) {
+    return new Response(JSON.stringify({ ok:false, error:"SAM_API_KEY is not configured." }), {
+      status:500, headers:{ ...headers, "Content-Type":"application/json" }
+    });
+  }
+  let body = {};
+  if (request.method === "POST") {
+    const txt = await request.text();
+    try { body = JSON.parse(txt); } catch { body = {}; }
+  }
+  const qp = pickQPFromBody(body);
+  const u  = buildSamUrlFromQP(env, qp);
+
+  const r   = await fetch(u.toString(), { cf: { cacheTtl: 900, cacheEverything: true } });
+  const txt = await r.text();
+
+  // Return the SAM response unchanged so your TSX (SamResponse) keeps working
+  return new Response(txt, {
+    status: r.status,
+    headers: { ...headers, "Content-Type": "application/json", "Cache-Control": "public, s-maxage=900, stale-while-revalidate=86400" }
+  });
+}
     return new Response("Not found", { status: 404, headers });
   },
 };
