@@ -427,137 +427,126 @@ export default {
       }
     }
 
-    /* ========================= Teaming Suggestions (NEW) =========================
-     * GET/POST /sb/teaming-suggestions?piid=...&naics=...&org=...&years=3&limit=5&exclude_ueis=UEI1,UEI2
-     */
-    if (last === "teaming-suggestions") {
-      // accept both GET query and POST JSON body
-      let p = {}
-      if (request.method === "GET") {
-        p = Object.fromEntries(url.searchParams.entries())
-      } else {
-        try { p = await request.json() } catch { p = {} }
-      }
+   /* ========================= Teaming Suggestions =========================
+ * GET/POST /sb/teaming-suggestions?piid=...&naics=...&org=...&years=3&limit=5&exclude_ueis=UEI1,UEI2
+ *  - suggests 3–5 vendors at the same org with NAICS overlap and relatively low obligated $ (hungry players)
+ *  - excludes incumbent + any UEIs in exclude_ueis
+ */
+if (last === "teaming-suggestions") {
+  const isPost = request.method === "POST"
+  let piid = (url.searchParams.get("piid") || "").trim().toUpperCase()
+  let naics = (url.searchParams.get("naics") || "").trim()
+  let org   = (url.searchParams.get("org")   || "").trim()
+  let years = Math.max(1, Math.min(10, parseInt(url.searchParams.get("years") || "3", 10)))
+  let limit = Math.max(3, Math.min(10, parseInt(url.searchParams.get("limit") || "5", 10)))
+  let excludeUEIs = (url.searchParams.get("exclude_ueis") || "").split(",").map(s=>s.trim().toUpperCase()).filter(Boolean)
 
-      const piid  = String(p.piid || "").trim().toUpperCase()
-      const naics = String(p.naics || "").trim()
-      const org   = String(p.org || "").trim()
-      const years = Math.max(1, Number(p.years ?? 3) || 3)
-      const limit = Math.max(1, Number(p.limit ?? 5) || 5)
-      const excludeUEIs = String(p.exclude_ueis || "")
-        .split(",").map(s => s.trim().toUpperCase()).filter(Boolean)
+  if (isPost) {
+    try {
+      const b = await request.json()
+      piid = (b.piid || piid || "").toUpperCase()
+      naics = b.naics || naics
+      org = b.org || org
+      years = Math.max(1, Math.min(10, parseInt(b.years || years, 10)))
+      limit = Math.max(3, Math.min(10, parseInt(b.limit || limit, 10)))
+      if (Array.isArray(b.exclude_ueis)) excludeUEIs = b.exclude_ueis.map(String).map(s=>s.toUpperCase())
+    } catch {}
+  }
 
-      if (!naics || !org) {
-        return new Response(JSON.stringify({ ok:false, error:"Missing required params: naics, org" }), {
-          status: 400, headers: { ...headers, "Content-Type":"application/json" }
-        })
-      }
+  if (!org) {
+    return new Response(JSON.stringify({ ok:false, error:"Missing 'org' (agency/sub-agency/office name)" }), {
+      status: 400, headers: { ...headers, "Content-Type":"application/json" }
+    })
+  }
 
-      const fyMin = fyNowUTC() - years + 1
-      const orgLike = `%${org}%`
+  const client = makeClient(env)
+  try {
+    await client.connect()
 
-      const client = makeClient(env)
-      try {
-        await client.connect()
-
-        // Try to exclude the incumbent prime (recipient_uei) for the given PIID
-        if (piid) {
-          try {
-            const inc = await client.query(
-              `SELECT DISTINCT recipient_uei FROM ${USA_TABLE} WHERE award_id_piid = $1 LIMIT 1`, [piid]
-            )
-            const incUei = (inc?.rows?.[0]?.recipient_uei || "").toUpperCase()
-            if (incUei) excludeUEIs.push(incUei)
-          } catch {}
-        }
-        const excludeParam = (excludeUEIs.length ? excludeUEIs : [""]).map(s => s.toUpperCase())
-
-        const sql = `
-WITH pool AS (
-  SELECT LOWER(TRIM(recipient_uei)) AS uei,
-         COALESCE(NULLIF(recipient_name,''),'—') AS name,
-         SUM(total_dollars_obligated_num) AS obligated
-  FROM ${USA_TABLE}
-  WHERE fiscal_year >= $1
-    AND (naics_code = $2 OR LEFT(naics_code,3) = LEFT($2,3))
-    AND (
-      awarding_sub_agency_name ILIKE $3 OR
-      awarding_office_name     ILIKE $3 OR
-      awarding_agency_name     ILIKE $3
-    )
-    AND COALESCE(UPPER(recipient_uei),'') <> ALL($4::text[])
-  GROUP BY recipient_uei, recipient_name
-),
-enriched AS (
-  SELECT
-    p.uei, p.name, p.obligated,
-    (
-      SELECT s.type_of_set_aside
-      FROM (
-        SELECT COALESCE(NULLIF(type_of_set_aside,''),'NONE') AS type_of_set_aside,
-               COUNT(*) AS c
-        FROM ${USA_TABLE} a
-        WHERE a.recipient_uei = p.uei
-          AND a.fiscal_year   >= $1
-          AND (
-            a.awarding_sub_agency_name ILIKE $3 OR
-            a.awarding_office_name     ILIKE $3 OR
-            a.awarding_agency_name     ILIKE $3
-          )
-        GROUP BY 1
-        ORDER BY c DESC NULLS LAST
-        LIMIT 1
-      ) s
-    ) AS set_aside,
-    COALESCE((
-      SELECT json_agg(json_build_object(
-        'piid', a.award_id_piid,
-        'fiscal_year', a.fiscal_year,
-        'naics', a.naics_code,
-        'title', a.title,
-        'obligated', a.total_dollars_obligated_num
-      ) ORDER BY a.fiscal_year DESC, a.total_dollars_obligated_num DESC)
-      FROM (
-        SELECT award_id_piid, fiscal_year, naics_code, title, total_dollars_obligated_num
-        FROM ${USA_TABLE} a
-        WHERE a.recipient_uei = p.uei
-          AND a.fiscal_year   >= $1
-          AND (
-            a.awarding_sub_agency_name ILIKE $3 OR
-            a.awarding_office_name     ILIKE $3 OR
-            a.awarding_agency_name     ILIKE $3
-          )
-        ORDER BY fiscal_year DESC, total_dollars_obligated_num DESC
-        LIMIT 6
-      ) a
-    ), '[]'::json) AS recent_awards
-  FROM pool p
-)
-SELECT UPPER(uei) AS uei,
-       name,
-       COALESCE(set_aside,'—') AS set_aside,
-       obligated,
-       recent_awards,
-       NULL::text AS website,
-       NULL::json AS contact
-FROM enriched
-ORDER BY obligated ASC NULLS FIRST
-LIMIT $5;
-        `
-        const params = [fyMin, naics, orgLike, excludeParam, limit]
-        const { rows } = await client.query(sql, params)
-
-        return new Response(JSON.stringify({ ok:true, rows }), {
-          status: 200, headers: { ...headers, "Content-Type":"application/json" }
-        })
-      } catch (e) {
-        return new Response(JSON.stringify({ ok:false, error:e?.message || "teaming-suggestions failed" }), {
-          status: 500, headers: { ...headers, "Content-Type":"application/json" }
-        })
-      } finally {
-        try { await client.end() } catch {}
-      }
+    // Incumbent UEI (exclude)
+    if (piid) {
+      const inc = await client.query(
+        `SELECT recipient_uei FROM ${USA_TABLE} WHERE award_id_piid = $1 ORDER BY pop_current_end_date DESC NULLS LAST LIMIT 1`,
+        [piid]
+      )
+      const incUEI = (inc.rows?.[0]?.recipient_uei || "").toUpperCase()
+      if (incUEI) excludeUEIs.push(incUEI)
     }
+    const exclude = Array.from(new Set(excludeUEIs.filter(Boolean)))
+
+    // Choose candidates at org with NAICS match (if provided), low total obligated in last N years
+    const sql = `
+      WITH cand AS (
+        SELECT
+          recipient_uei AS uei,
+          MAX(recipient_name) AS name,
+          MAX(NULLIF(type_of_set_aside,'')) AS set_aside,
+          SUM(total_dollars_obligated_num) AS obligated
+        FROM ${USA_TABLE}
+        WHERE recipient_uei IS NOT NULL
+          AND total_dollars_obligated_num IS NOT NULL
+          AND fiscal_year >= EXTRACT(YEAR FROM CURRENT_DATE)::int - ($3::int - 1)
+          AND (
+            $2::text IS NULL
+            OR awarding_agency_name = $2
+            OR awarding_sub_agency_name = $2
+            OR awarding_office_name = $2
+          )
+          AND (
+            $1::text IS NULL OR naics_code = $1
+          )
+        GROUP BY recipient_uei
+      )
+      SELECT
+        c.uei, c.name, c.set_aside, c.obligated,
+        (
+          SELECT json_agg(x ORDER BY x.fiscal_year DESC, x.obligated DESC) FROM (
+            SELECT
+              award_id_piid AS piid,
+              fiscal_year,
+              naics_code AS naics,
+              title,
+              total_dollars_obligated_num AS obligated
+            FROM ${USA_TABLE}
+            WHERE recipient_uei = c.uei
+              AND fiscal_year >= EXTRACT(YEAR FROM CURRENT_DATE)::int - ($3::int - 1)
+              AND (
+                $2::text IS NULL
+                OR awarding_agency_name = $2
+                OR awarding_sub_agency_name = $2
+                OR awarding_office_name = $2
+              )
+            ORDER BY fiscal_year DESC, pop_current_end_date DESC NULLS LAST
+            LIMIT 5
+          ) x
+        ) AS recent_awards
+      FROM cand c
+      WHERE c.obligated > 0
+        AND (CASE WHEN array_length($4::text[],1) IS NULL THEN TRUE ELSE NOT (c.uei = ANY($4::text[])) END)
+      ORDER BY c.obligated ASC NULLS LAST
+      LIMIT $5
+    `
+    const params = [naics || null, org || null, years, exclude.length ? exclude : null, limit]
+    const { rows } = await client.query(sql, params)
+
+    // add website if we can (best-effort)
+    const results = []
+    for (const r of rows) {
+      const website = await fetchVendorWebsiteByUEI(r.uei, env).catch(()=>null)
+      results.push({ ...r, website })
+    }
+
+    return new Response(JSON.stringify({ ok:true, rows: results }), {
+      status: 200, headers: { ...headers, "Content-Type":"application/json" }
+    })
+  } catch (e) {
+    return new Response(JSON.stringify({ ok:false, error: e?.message || "teaming suggestions failed" }), {
+      status: 500, headers: { ...headers, "Content-Type":"application/json" }
+    })
+  } finally {
+    try { await client.end() } catch {}
+  }
+}
 
     /* ========================= Contract Insights (AI + subs) =========================
      * POST /sb/contracts/insights  { piid: "..." }
