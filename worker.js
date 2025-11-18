@@ -46,7 +46,7 @@ function fyNowUTC() {
 }
 
 /* ========================= Column mapping ========================= */
-const USA_TABLE = "public.usaspending_awards_v2" // <-- v2 view
+const USA_TABLE = "public.usaspending_awards_fast" // <-- fast materialized view
 
 const COL = {
   END_DATE: "pop_current_end_date",
