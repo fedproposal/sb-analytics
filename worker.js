@@ -864,8 +864,6 @@ function isMDY(s) {
 
 function buildSamURL(env, body) {
   const u = new URL("https://api.sam.gov/prod/opportunities/v2/search");
-
-  // API key
   if (!env.SAM_API_KEY) throw new Error("SAM_API_KEY is not configured");
   u.searchParams.set("api_key", env.SAM_API_KEY);
 
@@ -884,8 +882,8 @@ function buildSamURL(env, body) {
     isMDY(body.posted_to) ? body.posted_to :
     fmtMDY(now);
 
-  u.searchParams.set("postedFrom", postedFrom); // MM/dd/yyyy
-  u.searchParams.set("postedTo",   postedTo);   // MM/dd/yyyy
+  u.searchParams.set("postedFrom", postedFrom);
+  u.searchParams.set("postedTo",   postedTo);
 
   // notice types
   for (const t of coerceTypes(body.noticeTypes ?? body.type ?? body.noticeType)) {
@@ -897,7 +895,7 @@ function buildSamURL(env, body) {
     u.searchParams.append("naics", code);
   }
 
-  // Keyword / org (SAM doesn’t have “agency contains”; stuff into keyword)
+  // Keyword / org (SAM doesn’t have “agency contains”; push into keyword)
   const q =
     body.q ?? body.keyword ?? body.keywords ?? body.search ?? body.searchText ?? body.searchTerm ?? "";
   const org =
@@ -941,7 +939,7 @@ if (segments[0] === "opportunities" && last === "search") {
       cf: { cacheTtl: 900, cacheEverything: true },
       headers: { "Accept": "application/json" }
     });
-    const txt = await r.text();
+    const rawText = await r.text();
 
     const passHeaders = {
       ...headers,
@@ -950,6 +948,7 @@ if (segments[0] === "opportunities" && last === "search") {
       "x-sam-url": samURL.toString(),
     };
 
+    // 4xx → wrap with friendlier JSON
     if (r.status >= 400 && r.status < 500) {
       return new Response(JSON.stringify({
         ok: false,
@@ -957,14 +956,45 @@ if (segments[0] === "opportunities" && last === "search") {
         hint:
           r.status === 400
             ? "SAM rejected the parameters. Check date format (MM/dd/yyyy), notice types, and window <= 365 days."
-            : r.status === 401 || r.status === 403
+            : (r.status === 401 || r.status === 403)
             ? "Check SAM_API_KEY on the Worker."
             : "Upstream client error.",
-        upstream: txt
+        upstream: rawText
       }), { status: 400, headers: passHeaders });
     }
 
-    return new Response(txt, { status: r.status, headers: passHeaders });
+    // Normalize to UI shape: { totalRecords, limit, offset, opportunitiesData }
+    let normalized;
+    try {
+      const j = rawText ? JSON.parse(rawText) : {};
+      const dataAny =
+        j?.opportunitiesData ??
+        j?.searchResults ??
+        j?.data ??
+        j?.results ??
+        [];
+      const opportunitiesData = Array.isArray(dataAny)
+        ? dataAny
+        : Array.isArray(dataAny?.opportunitiesData)
+        ? dataAny.opportunitiesData
+        : [];
+
+      const totalRecords =
+        j?.totalRecords ??
+        j?.total ??
+        (Array.isArray(opportunitiesData) ? opportunitiesData.length : 0);
+
+      const limit =
+        Number(j?.limit ?? body.limit ?? 25) || 25;
+      const offset =
+        Number(j?.offset ?? body.offset ?? 0) || 0;
+
+      normalized = { totalRecords, limit, offset, opportunitiesData };
+    } catch {
+      normalized = { totalRecords: 0, limit: 25, offset: 0, opportunitiesData: [] };
+    }
+
+    return new Response(JSON.stringify(normalized), { status: 200, headers: passHeaders });
   } catch (e) {
     return new Response(JSON.stringify({ ok:false, error: String(e?.message || e) }), {
       status: 500, headers: { ...headers, "Content-Type":"application/json" }
