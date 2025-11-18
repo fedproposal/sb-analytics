@@ -840,9 +840,7 @@ function coerceTypes(input) {
     .map(s => String(s || "").trim())
     .filter(Boolean)
     .filter(t => SAM_ALLOWED_TYPES.has(t));
-  // default if nothing valid
   if (types.length === 0) types = ["Solicitation"];
-  // SAM lets us repeat noticeType
   return types;
 }
 
@@ -853,6 +851,17 @@ function coerceNaics(input) {
   ));
 }
 
+// --- helpers for SAM date format (MM/dd/yyyy)
+function fmtMDY(d) {
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  const yyyy = d.getFullYear();
+  return `${mm}/${dd}/${yyyy}`;
+}
+function isMDY(s) {
+  return /^\d{2}\/\d{2}\/\d{4}$/.test(String(s || ""));
+}
+
 function buildSamURL(env, body) {
   const u = new URL("https://api.sam.gov/prod/opportunities/v2/search");
 
@@ -860,13 +869,23 @@ function buildSamURL(env, body) {
   if (!env.SAM_API_KEY) throw new Error("SAM_API_KEY is not configured");
   u.searchParams.set("api_key", env.SAM_API_KEY);
 
-  // Window (postedFrom/postedTo)
+  // Window (postedFrom/postedTo) — SAM REQUIRES MM/dd/yyyy
   const days = Math.max(1, Math.min(365, parseInt(body.windowDays ?? "15", 10)));
-  const now = new Date();
+  const now  = new Date();
   const from = new Date(now.getTime() - days * 86400000);
-  const iso = d => d.toISOString().slice(0, 10);
-  u.searchParams.set("postedFrom", iso(from));
-  u.searchParams.set("postedTo", iso(now));
+
+  const postedFrom =
+    isMDY(body.postedFrom) ? body.postedFrom :
+    isMDY(body.posted_from) ? body.posted_from :
+    fmtMDY(from);
+
+  const postedTo =
+    isMDY(body.postedTo) ? body.postedTo :
+    isMDY(body.posted_to) ? body.posted_to :
+    fmtMDY(now);
+
+  u.searchParams.set("postedFrom", postedFrom); // MM/dd/yyyy
+  u.searchParams.set("postedTo",   postedTo);   // MM/dd/yyyy
 
   // notice types
   for (const t of coerceTypes(body.noticeTypes ?? body.type ?? body.noticeType)) {
@@ -878,7 +897,7 @@ function buildSamURL(env, body) {
     u.searchParams.append("naics", code);
   }
 
-  // Keyword / org (SAM doesn’t have a clean “agency contains”, so push into keyword)
+  // Keyword / org (SAM doesn’t have “agency contains”; stuff into keyword)
   const q =
     body.q ?? body.keyword ?? body.keywords ?? body.search ?? body.searchText ?? body.searchTerm ?? "";
   const org =
@@ -889,17 +908,17 @@ function buildSamURL(env, body) {
   // Set-aside
   const setAsideRaw = body.setAside ?? body.setAsideCodes ?? body.typeOfSetAside ?? body.type_of_set_aside;
   if (setAsideRaw) {
-    const val = Array.isArray(setAsideRaw) ? setAsideRaw[0] : setAsideRaw;
+    const val  = Array.isArray(setAsideRaw) ? setAsideRaw[0] : setAsideRaw;
     const code = String(val || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
     if (code) u.searchParams.set("setAsideCode", code);
   }
 
   // Pagination & sort
-  const limit = Math.max(1, Math.min(100, parseInt(body.limit ?? "25", 10)));
+  const limit  = Math.max(1, Math.min(100, parseInt(body.limit ?? "25", 10)));
   const offset = Math.max(0, parseInt(body.offset ?? "0", 10));
   u.searchParams.set("limit", String(limit));
   u.searchParams.set("offset", String(offset));
-  u.searchParams.set("sort", "modifiedDate"); // SAM expects `sort`
+  u.searchParams.set("sort", "modifiedDate");
   u.searchParams.set("order", "desc");
 
   return u;
@@ -924,7 +943,6 @@ if (segments[0] === "opportunities" && last === "search") {
     });
     const txt = await r.text();
 
-    // Pass body through; add a debug header with the SAM URL we called
     const passHeaders = {
       ...headers,
       "Content-Type": "application/json",
@@ -932,14 +950,13 @@ if (segments[0] === "opportunities" && last === "search") {
       "x-sam-url": samURL.toString(),
     };
 
-    // On 4xx, wrap a friendlier error (keep original text too)
     if (r.status >= 400 && r.status < 500) {
       return new Response(JSON.stringify({
         ok: false,
         status: r.status,
         hint:
           r.status === 400
-            ? "SAM rejected the parameters. Common fixes: remove unsupported notice types, ensure at least one of {keyword, NAICS, setAside} is present, and keep window <= 365 days."
+            ? "SAM rejected the parameters. Check date format (MM/dd/yyyy), notice types, and window <= 365 days."
             : r.status === 401 || r.status === 403
             ? "Check SAM_API_KEY on the Worker."
             : "Upstream client error.",
