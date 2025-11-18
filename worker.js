@@ -35,19 +35,29 @@ function makeClient(env) {
 const TBL_FAST = "public.usaspending_awards_fast";
 const TBL_V2   = "public.usaspending_awards_v2";
 
-/** Helper: run a query first against FAST, and fall back to V2 when
- * the MV isn't populated / relation missing / timeout. */
+// Robust FAST→V2 fallback (handles unpopulated MV, missing relation, timeouts)
 async function queryWithFallback(client, sqlFast, sqlV2, params) {
   try {
     return await client.query(sqlFast, params);
   } catch (e) {
-    const msg = String(e?.message || "").toLowerCase();
+    const msg  = String(e?.message || "").toLowerCase();
+    const code = String(e?.code || "");
+
+    // Known cases where we should retry on the v2 view
     const shouldFallback =
+      code === "55000" ||                // object not in prerequisite state (e.g., MV not populated)
+      code === "42P01" ||                // undefined_table (relation/view doesn’t exist)
+      msg.includes("materialized view") && msg.includes("not been populated") ||
       msg.includes("has not been populated") ||
+      msg.includes("relation") && msg.includes("does not exist") ||
+      msg.includes("undefined table") ||
       msg.includes("does not exist") ||
       msg.includes("timeout") ||
       msg.includes("canceling statement due to statement timeout");
+
     if (!shouldFallback) throw e;
+
+    // Fallback to the slower but safe logical view
     return await client.query(sqlV2, params);
   }
 }
