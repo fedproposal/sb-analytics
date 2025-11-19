@@ -661,20 +661,22 @@ if (last === "usa-contract") {
   if (!metaRes.ok || !metaRd.json) return dbg("awards/{id}", metaRes, metaRd.raw, "Meta request failed");
   const meta = metaRd.json;
 
-  // 4) Transactions (mods / obligations)
-  const txRes = await fetch(
-    `https://api.usaspending.gov/api/v2/awards/${encodeURIComponent(award_id)}/transactions/?page=1&limit=500`,
-    { headers: USAS_HEADERS_GET, cf: { cacheTtl: 900, cacheEverything: false } }
-  );
-  const txRd = await readJSON(txRes);
-  if (!txRes.ok || !txRd.json) return dbg("awards/{id}/transactions", txRes, txRd.raw, "Transactions request failed");
+  // 4) // Transactions (mods)
+const txRes = await fetch(
+  `https://api.usaspending.gov/api/v2/awards/${encodeURIComponent(award_id)}/transactions/?page=1&limit=500`,
+  { headers: USAS_HEADERS_GET, cf: { cacheTtl: 900, cacheEverything: false } }
+);
+const txRd = await readJSON(txRes);
+if (!txRes.ok || !txRd.json) return dbg("awards/{id}/transactions", txRes, txRd.raw, "Transactions request failed");
 
-  const spendPoints = (Array.isArray(txRd.json?.results) ? txRd.json.results : []).map(r => ({
-    date: r.action_date,
-    obligation: Number(r.federal_action_obligation || 0),
-    mod: r.modification_number ?? "",
-    type: r.type || "",
-  }));
+// ⬇️ now include type + description
+const spendPoints = (Array.isArray(txRd.json?.results) ? txRd.json.results : []).map(r => ({
+  date: r.action_date,
+  obligation: Number(r.federal_action_obligation || 0),
+  mod: r.modification_number ?? "",
+  type: r.action_type_description || "",
+  description: r.description || ""
+}));
 
   return new Response(JSON.stringify({
     ok: true,
