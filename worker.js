@@ -670,63 +670,110 @@ export default {
     }
 
     /* ---- memo ---- */
-    if (last === "bid-nobid-memo") {
-      const piid  = (url.searchParams.get("piid") || "").trim().toUpperCase();
-      const uei   = (url.searchParams.get("uei")  || "").trim().toUpperCase();
-      const years = (url.searchParams.get("years")|| "5").trim();
-      if (!piid || !uei) {
-        return new Response(JSON.stringify({ ok:false, error:"Missing piid or uei" }), {
-          status: 400, headers: { ...headers, "Content-Type":"application/json" }
-        });
-      }
-      const scorer = new URL(url.toString());
-      scorer.pathname = "/sb/bid-nobid";
-      scorer.search = `?piid=${encodeURIComponent(piid)}&uei=${encodeURIComponent(uei)}&years=${encodeURIComponent(years)}`;
-      const j = await fetchJSON(scorer.toString()).catch(e => ({ ok:false, error: e?.message }));
-      if (!j?.ok) {
-        return new Response(JSON.stringify({ ok:false, error: j?.error || "bid-nobid failed" }), {
-          status: 500, headers: { ...headers, "Content-Type":"application/json" }
-        });
-      }
-      if (!env.OPENAI_API_KEY) {
-        return new Response(JSON.stringify({ ok:false, error:"OPENAI_API_KEY not set" }), {
-          status: 500, headers: { ...headers, "Content-Type":"application/json" }
-        });
-      }
-      const lines = (j.criteria || []).map(c => `${c.name} | weight ${c.weight}% | score ${c.score}/5 | ${c.reason||""}`).join("\n");
-      const prompt = `
-You are the Bid/No-Bid Decision GPT for federal capture. Use the scored matrix below to produce:
-1) A decision (Bid / Conditional / No-Bid) with percent.
-2) A 5–7 line executive memo referencing the actual numbers (NAICS match, org history $, socio-econ vs set-aside, incumbent strength, schedule/burn, price percentile).
+if (last === "bid-nobid-memo") {
+  const piid  = (url.searchParams.get("piid") || "").trim().toUpperCase();
+  const uei   = (url.searchParams.get("uei")  || "").trim().toUpperCase();
+  const years = (url.searchParams.get("years")|| "5").trim();
 
-Inputs:
-- PIID: ${j?.inputs?.piid || piid}
-- Org: ${j?.inputs?.org || "—"}
-- NAICS: ${j?.inputs?.naics || "—"}
-- Decision: ${j?.decision || "—"} (${j?.weighted_percent ?? "—"}%)
+  if (!piid || !uei) {
+    return new Response(JSON.stringify({ ok:false, error:"Missing piid or uei" }), {
+      status: 400, headers: { ...headers, "Content-Type":"application/json" }
+    });
+  }
 
-Matrix:
+  // Call your scorer first (same as before)
+  const scorer = new URL(url.toString());
+  scorer.pathname = "/sb/bid-nobid";
+  scorer.search = `?piid=${encodeURIComponent(piid)}&uei=${encodeURIComponent(uei)}&years=${encodeURIComponent(years)}`;
+  const j = await fetchJSON(scorer.toString()).catch(e => ({ ok:false, error: e?.message }));
+
+  if (!j?.ok) {
+    return new Response(JSON.stringify({ ok:false, error: j?.error || "bid-nobid failed" }), {
+      status: 500, headers: { ...headers, "Content-Type":"application/json" }
+    });
+  }
+
+  if (!env.OPENAI_API_KEY) {
+    return new Response(JSON.stringify({ ok:false, error:"OPENAI_API_KEY not set" }), {
+      status: 500, headers: { ...headers, "Content-Type":"application/json" }
+    });
+  }
+
+  // Normalize commonly-used inputs (defensive fallbacks)
+  const inputs      = j?.inputs || {};
+  const orgName     = (inputs.org   || "—").toString();
+  const naics       = (inputs.naics || "—").toString();
+  const setAsideRaw = (inputs.set_aside || inputs.setAside || inputs.setAsideType || "NONE").toString().toUpperCase();
+  const decision    = (j?.decision || "—").toString();
+  const pct         = String(j?.weighted_percent ?? "—");
+
+  // Strict rules to stop hallucinated set-asides
+  // If set-aside is NONE / FULL AND OPEN / N/A, the memo must NOT mention any socio-econ program.
+  const NON_MENTION_SETASIDES = new Set(["NONE", "N/A", "FULL AND OPEN", "FULL & OPEN", "FULL AND OPEN COMPETITION", "UNRESTRICTED"]);
+
+  const lines = (j.criteria || [])
+    .map((c: any) => `${c.name} | weight ${c.weight}% | score ${c.score}/5 | ${c.reason || ""}`)
+    .join("\n");
+
+  const prompt = `
+You are the Bid/No-Bid Decision GPT for federal capture. Follow the rules exactly.
+
+GOAL
+Return:
+1) A decision line: BID / CONDITIONAL / NO-BID with percent.
+2) A 5–7 line executive memo that references ONLY the provided facts and scores.
+
+FACTS
+- PIID: ${inputs.piid || piid}
+- Org: ${orgName}
+- NAICS: ${naics}
+- Set-aside: ${setAsideRaw}
+- Model Decision: ${decision} (${pct}%)
+
+SCORED MATRIX (source of truth for reasoning)
 ${lines}
-Keep it concise and specific—no fluff.`.trim();
 
-      const aiRes = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: { "Content-Type":"application/json", "Authorization":`Bearer ${env.OPENAI_API_KEY}` },
-        body: JSON.stringify({
-          model: "gpt-4.1-mini",
-          messages: [{ role: "system", content: "You are a federal capture strategist." }, { role: "user", content: prompt }],
-          temperature: 0.3, max_tokens: 900
-        })
-      });
-      const txt = await aiRes.text();
-      let memo = "";
-      try { memo = JSON.parse(txt).choices?.[0]?.message?.content?.trim() || ""; }
-      catch { memo = txt.slice(0, 3000); }
+HARD RULES (must follow)
+- Do NOT invent details. If a fact is not present above, do not mention it.
+- Mention set-aside ONLY if it is explicitly a socio-economic restriction (e.g., 8(a), WOSB/EWOSB, SDVOSB, HUBZone, Small Business). 
+- If set-aside is one of: ${Array.from(NON_MENTION_SETASIDES).join(", ")} then do NOT mention any set-aside or socio-economic eligibility at all.
+- Never state Women-Owned, 8(a), HUBZone, SDVOSB, or Small Business unless set-aside explicitly includes it.
+- Reference numeric items (scores or amounts) that appear in the matrix or inputs (e.g., NAICS match/fit score, awards $, burn %, days to end, price percentile, incumbent strength).
+- Keep the memo concise (5–7 lines), specific, and free of fluff.
 
-      return new Response(JSON.stringify({ ok:true, ...j, memo }), {
-        status: 200, headers: { ...headers, "Content-Type":"application/json" }
-      });
-    }
+OUTPUT FORMAT
+Decision: <BID / CONDITIONAL / NO-BID> (<percent>%)
+
+Executive Memo:
+<5–7 lines using only the facts and matrix>
+`.trim();
+
+  const aiRes = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type":"application/json", "Authorization": `Bearer ${env.OPENAI_API_KEY}` },
+    body: JSON.stringify({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: "You are a federal capture strategist. Obey all hard rules and never invent facts." },
+        { role: "user", content: prompt }
+      ],
+      temperature: 0.2,
+      max_tokens: 900
+    })
+  });
+
+  const txt = await aiRes.text();
+  let memo = "";
+  try {
+    memo = JSON.parse(txt).choices?.[0]?.message?.content?.trim() || "";
+  } catch {
+    memo = txt.slice(0, 3000);
+  }
+
+  return new Response(JSON.stringify({ ok:true, ...j, memo }), {
+    status: 200, headers: { ...headers, "Content-Type":"application/json" }
+  });
+}
 
     /* ---- Teaming Intelligence ---- */
     if (last === "teaming-suggestions") {
