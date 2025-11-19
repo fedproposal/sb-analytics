@@ -1001,6 +1001,53 @@ if (segments[0] === "opportunities" && last === "search") {
     });
   }
 }
+/* ---- contract-activity (timeseries) ---- */
+if (last === "contract-activity") {
+  const piid = (url.searchParams.get("piid") || "").trim().toUpperCase();
+  if (!piid) {
+    return new Response(JSON.stringify({ ok:false, error:"Missing piid" }), {
+      status:400, headers: { ...headers, "Content-Type":"application/json" }
+    });
+  }
+
+  // 1) Resolve quick facts (org, naics, start/end, value) and award identifier(s)
+  const facts = await fetchJSON(`${origin}/sb/contracts/insights`, {
+    method:"POST",
+    headers:{ "Content-Type":"application/json" },
+    body: JSON.stringify({ piid })
+  }).catch(() => ({}));
+
+  const popStart = facts?.primary?.popStart || facts?.pop_start || null;
+  const currentEnd = facts?.primary?.popCurrentEnd || facts?.current_end || null;
+  const potentialEnd = facts?.primary?.popPotentialEnd || facts?.potential_end || null;
+
+  // 2) Pull award mods/transactions (use whatever you already index; fallback to USAspending if you proxy it)
+  // Expect each row like: { action_date: "YYYY-MM-DD", obligated: number }
+  const tx = await fetchJSON(`${origin}/sb/transactions?piid=${encodeURIComponent(piid)}&fields=action_date,obligated`).catch(() => ({ rows: [] }));
+  const rows = Array.isArray(tx?.rows) ? tx.rows : [];
+
+  // 3) Build cumulative curve
+  const points = rows
+    .filter(r => r?.action_date)
+    .sort((a,b) => a.action_date.localeCompare(b.action_date))
+    .map(r => ({ date: r.action_date, amount: Number(r.obligated || 0) }));
+
+  let running = 0;
+  const cumulative = points.map(p => {
+    running += isFinite(p.amount) ? p.amount : 0;
+    return { date: p.date, cumulative: running, delta: p.amount };
+  });
+
+  return new Response(JSON.stringify({
+    ok: true,
+    piid,
+    pop_start: popStart,
+    current_end: currentEnd,
+    potential_end: potentialEnd,
+    points: cumulative
+  }), { status: 200, headers: { ...headers, "Content-Type":"application/json" }});
+}
+    
     return new Response("Not found", { status: 404, headers });
   },
 };
