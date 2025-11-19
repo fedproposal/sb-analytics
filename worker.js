@@ -445,7 +445,114 @@ export default {
         });
       } finally { try { await client.end(); } catch {} }
     }
+/* ---- usa-contract (PIID -> award meta + transactions) ---- */
+if (last === "usa-contract") {
+  const piid = (url.searchParams.get("piid") || "").trim().toUpperCase();
+  if (!piid) {
+    return new Response(JSON.stringify({ ok:false, error:"Missing piid" }), {
+      status: 400, headers: { ...headers, "Content-Type":"application/json" }
+    });
+  }
 
+  // WAF-friendly headers for USAspending
+  const apiHeaders: Record<string, string> = {
+    "accept": "application/json",
+    "content-type": "application/json",
+    "origin": "https://www.usaspending.gov",
+    "referer": "https://www.usaspending.gov/",
+    "user-agent": "Mozilla/5.0 (FedProposal-Worker)"
+  };
+
+  // 1) Find the award by PIID (search/spending_by_award)
+  const searchBody = {
+    fields: [
+      "piid", "generated_unique_award_id",
+      "period_of_performance_start_date",
+      "period_of_performance_current_end_date",
+      "period_of_performance_potential_end_date",
+      "current_total_value_of_award",
+      "potential_total_value_of_award"
+    ],
+    filters: { keywords: [piid], award_type_codes: ["A","B","C","D"] },
+    page: 1, limit: 1, sort: "period_of_performance_start_date", order: "desc"
+  };
+
+  const searchRes = await fetch(
+    "https://api.usaspending.gov/api/v2/search/spending_by_award/",
+    { method: "POST", headers: apiHeaders, body: JSON.stringify(searchBody) }
+  );
+  const searchTxt = await searchRes.text();
+  if (!searchRes.ok) {
+    return new Response(JSON.stringify({ ok:false, error:`search failed: ${searchRes.status} ${searchTxt.slice(0,200)}` }), {
+      status: 502, headers: { ...headers, "Content-Type":"application/json" }
+    });
+  }
+  let searchJson: any = {};
+  try { searchJson = JSON.parse(searchTxt); } catch { /* fall through */ }
+
+  const award = searchJson?.results?.[0];
+  const award_id = award?.generated_unique_award_id || award?.award_id;
+  if (!award_id) {
+    return new Response(JSON.stringify({ ok:false, error:`No award found for PIID ${piid}` }), {
+      status: 404, headers: { ...headers, "Content-Type":"application/json" }
+    });
+  }
+
+  // 2) Award metadata (POP dates, totals)
+  const metaRes = await fetch(
+    `https://api.usaspending.gov/api/v2/awards/${encodeURIComponent(award_id)}/`,
+    { headers: { accept: "application/json", "user-agent": apiHeaders["user-agent"] } }
+  );
+  const metaTxt = await metaRes.text();
+  let meta: any = {};
+  try { meta = JSON.parse(metaTxt); } catch {}
+  if (!metaRes.ok) {
+    return new Response(JSON.stringify({ ok:false, error:`meta failed: ${metaRes.status} ${metaTxt.slice(0,200)}` }), {
+      status: 502, headers: { ...headers, "Content-Type":"application/json" }
+    });
+  }
+
+  // 3) Transactions (obligations over time; mods)
+  const txRes = await fetch(
+    `https://api.usaspending.gov/api/v2/awards/${encodeURIComponent(award_id)}/transactions/?page=1&limit=500`,
+    { headers: { accept: "application/json", "user-agent": apiHeaders["user-agent"] } }
+  );
+  const txTxt = await txRes.text();
+  let tx: any = {};
+  try { tx = JSON.parse(txTxt); } catch {}
+  if (!txRes.ok) {
+    return new Response(JSON.stringify({ ok:false, error:`transactions failed: ${txRes.status} ${txTxt.slice(0,200)}` }), {
+      status: 502, headers: { ...headers, "Content-Type":"application/json" }
+    });
+  }
+
+  // 4) Normalize for your chart
+  const transactions = Array.isArray(tx?.results) ? tx.results : [];
+  const spendPoints = transactions.map((r: any) => ({
+    date: r.action_date,
+    obligation: Number(r.federal_action_obligation || 0),
+    mod: r.modification_number ?? "",
+    type: r.type || ""
+  }));
+
+  const payload = {
+    ok: true,
+    piid,
+    award_id,
+    meta: {
+      pop_start: meta?.period_of_performance_start_date || award?.period_of_performance_start_date || null,
+      pop_current_end: meta?.period_of_performance_current_end_date || award?.period_of_performance_current_end_date || null,
+      pop_potential_end: meta?.period_of_performance_potential_end_date || award?.period_of_performance_potential_end_date || null,
+      current_total_value_of_award: meta?.current_total_value_of_award ?? award?.current_total_value_of_award ?? null,
+      potential_total_value_of_award: meta?.potential_total_value_of_award ?? award?.potential_total_value_of_award ?? null
+    },
+    spendPoints
+  };
+
+  return new Response(JSON.stringify(payload), {
+    status: 200, headers: { ...headers, "Content-Type":"application/json" }
+  });
+}
     /* ---- my-entity ---- */
     if (last === "my-entity") {
       const uei = (url.searchParams.get("uei") || "").trim().toUpperCase();
