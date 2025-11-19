@@ -564,145 +564,154 @@ export default {
       }
     }
 
-    /* -----------------------------------------------------------
-       usa-contract  (PIID -> USAspending meta + transactions)
-       ----------------------------------------------------------- */
-    if (last === "usa-contract") {
-      const piid = (url.searchParams.get("piid") || "").trim().toUpperCase();
-      if (!piid) {
-        return new Response(JSON.stringify({ ok: false, error: "Missing piid" }), {
-          status: 400,
-          headers: { ...headers, "Content-Type": "application/json" },
-        });
-      }
+    /* ---- usa-contract (PIID -> award meta + transactions) ---- */
+if (last === "usa-contract") {
+  const piid  = (url.searchParams.get("piid")  || "").trim().toUpperCase();
+  const debug = (url.searchParams.get("debug") || "") === "1";
+  if (!piid) {
+    return new Response(JSON.stringify({ ok:false, error:"Missing piid" }), {
+      status: 400, headers: { ...headers, "Content-Type":"application/json" }
+    });
+  }
 
-      const apiHeaders = {
-        accept: "application/json",
-        "content-type": "application/json",
-        origin: "https://www.usaspending.gov",
-        referer: "https://www.usaspending.gov/",
-        "user-agent": "Mozilla/5.0 (FedProposal-Worker)",
-      };
+  // Headers that play nicely with USAspending’s WAF
+  const apiHeaders = {
+    accept: "application/json",
+    "content-type": "application/json",
+    origin: "https://www.usaspending.gov",
+    referer: "https://www.usaspending.gov/",
+    "user-agent": "Mozilla/5.0 (FedProposal-Worker)"
+  };
 
-      // 1) search by PIID
-      const searchBody = {
-        fields: [
-          "piid",
-          "generated_unique_award_id",
-          "period_of_performance_start_date",
-          "period_of_performance_current_end_date",
-          "period_of_performance_potential_end_date",
-          "current_total_value_of_award",
-          "potential_total_value_of_award",
-        ],
-        filters: { keywords: [piid], award_type_codes: ["A", "B", "C", "D"] },
-        page: 1,
-        limit: 1,
-        sort: "period_of_performance_start_date",
-        order: "desc",
-      };
+  // Helper to read JSON safely and optionally surface a trimmed text body
+  async function readJSON(res) {
+    const txt = await res.text();
+    try { return { json: JSON.parse(txt), raw: txt }; }
+    catch { return { json: null, raw: txt }; }
+  }
 
-      const searchRes = await fetch(
-        "https://api.usaspending.gov/api/v2/search/spending_by_award/",
-        { method: "POST", headers: apiHeaders, body: JSON.stringify(searchBody) }
-      );
-      const searchTxt = await searchRes.text();
-      if (!searchRes.ok) {
-        return new Response(
-          JSON.stringify({ ok: false, error: `search failed: ${searchRes.status} ${searchTxt.slice(0, 200)}` }),
-          { status: 502, headers: { ...headers, "Content-Type": "application/json" } }
-        );
-      }
-      let searchJson = {};
-      try {
-        searchJson = JSON.parse(searchTxt);
-      } catch {}
-      const award = searchJson && searchJson.results && searchJson.results[0];
-      const award_id = (award && (award.generated_unique_award_id || award.award_id)) || null;
-      if (!award_id) {
-        return new Response(JSON.stringify({ ok: false, error: `No award found for PIID ${piid}` }), {
-          status: 404,
-          headers: { ...headers, "Content-Type": "application/json" },
-        });
-      }
+  // ---------- 1) PRIMARY: POST /search/spending_by_award ----------
+  let award_id = null;
+  try {
+    const body = {
+      fields: [
+        "piid","generated_unique_award_id",
+        "period_of_performance_start_date",
+        "period_of_performance_current_end_date",
+        "period_of_performance_potential_end_date",
+        "current_total_value_of_award",
+        "potential_total_value_of_award"
+      ],
+      filters: { keywords: [piid], award_type_codes: ["A","B","C","D","E","F"] }, // include orders too
+      page: 1, limit: 1, sort: "period_of_performance_start_date", order: "desc"
+    };
 
-      // 2) meta
-      const metaRes = await fetch(
-        `https://api.usaspending.gov/api/v2/awards/${encodeURIComponent(award_id)}/`,
-        { headers: { accept: "application/json", "user-agent": apiHeaders["user-agent"] } }
-      );
-      const metaTxt = await metaRes.text();
-      let meta = {};
-      try {
-        meta = JSON.parse(metaTxt);
-      } catch {}
-      if (!metaRes.ok) {
-        return new Response(
-          JSON.stringify({ ok: false, error: `meta failed: ${metaRes.status} ${metaTxt.slice(0, 200)}` }),
-          { status: 502, headers: { ...headers, "Content-Type": "application/json" } }
-        );
-      }
+    const r = await fetch("https://api.usaspending.gov/api/v2/search/spending_by_award/", {
+      method: "POST",
+      headers: apiHeaders,
+      body: JSON.stringify(body),
+      // cache a bit to reduce repeated upstream load
+      cf: { cacheTtl: 900, cacheEverything: false }
+    });
 
-      // 3) transactions
-      const txRes = await fetch(
-        `https://api.usaspending.gov/api/v2/awards/${encodeURIComponent(award_id)}/transactions/?page=1&limit=500`,
-        { headers: { accept: "application/json", "user-agent": apiHeaders["user-agent"] } }
-      );
-      const txTxt = await txRes.text();
-      let tx = {};
-      try {
-        tx = JSON.parse(txTxt);
-      } catch {}
-      if (!txRes.ok) {
-        return new Response(
-          JSON.stringify({ ok: false, error: `transactions failed: ${txRes.status} ${txTxt.slice(0, 200)}` }),
-          { status: 502, headers: { ...headers, "Content-Type": "application/json" } }
-        );
-      }
-
-      const transactions = Array.isArray(tx && tx.results) ? tx.results : [];
-      const spendPoints = transactions.map((r) => ({
-        date: r.action_date,
-        obligation: Number(r.federal_action_obligation || 0),
-        mod: r.modification_number ?? "",
-        type: r.type || "",
-      }));
-
-      const payload = {
-        ok: true,
-        piid,
-        award_id,
-        meta: {
-          pop_start:
-            (meta && meta.period_of_performance_start_date) ||
-            (award && award.period_of_performance_start_date) ||
-            null,
-          pop_current_end:
-            (meta && meta.period_of_performance_current_end_date) ||
-            (award && award.period_of_performance_current_end_date) ||
-            null,
-          pop_potential_end:
-            (meta && meta.period_of_performance_potential_end_date) ||
-            (award && award.period_of_performance_potential_end_date) ||
-            null,
-          current_total_value_of_award:
-            (meta && meta.current_total_value_of_award) ||
-            (award && award.current_total_value_of_award) ||
-            null,
-          potential_total_value_of_award:
-            (meta && meta.potential_total_value_of_award) ||
-            (award && award.potential_total_value_of_award) ||
-            null,
-        },
-        spendPoints,
-      };
-
-      return new Response(JSON.stringify(payload), {
-        status: 200,
-        headers: { ...headers, "Content-Type": "application/json" },
-      });
+    const { json, raw } = await readJSON(r);
+    if (r.ok && json?.results?.length) {
+      const first = json.results[0];
+      award_id = first?.generated_unique_award_id || first?.award_id || null;
+    } else if (debug) {
+      return new Response(JSON.stringify({
+        ok:false, stage:"search/spending_by_award", status:r.status,
+        error:"Primary search failed", upstream: raw?.slice(0,400)
+      }), { status: 502, headers: { ...headers, "Content-Type":"application/json" } });
     }
+  } catch (e) {
+    // fall through to lookup
+  }
 
+  // ---------- 2) FALLBACK: GET /awards/lookup/?piid= ----------
+  if (!award_id) {
+    try {
+      const r = await fetch(
+        `https://api.usaspending.gov/api/v2/awards/lookup/?piid=${encodeURIComponent(piid)}`,
+        { headers: { accept:"application/json", "user-agent": apiHeaders["user-agent"] },
+          cf: { cacheTtl: 900, cacheEverything: false } }
+      );
+      const { json, raw } = await readJSON(r);
+      if (r.ok) {
+        const first = Array.isArray(json) ? json[0]
+                  : Array.isArray(json?.results) ? json.results[0] : null;
+        award_id = first?.generated_unique_award_id || first?.award_id || null;
+        if (!award_id && debug) {
+          return new Response(JSON.stringify({
+            ok:false, stage:"awards/lookup", status:r.status,
+            error:"Lookup returned no award_id", upstream: raw?.slice(0,400)
+          }), { status: 404, headers: { ...headers, "Content-Type":"application/json" } });
+        }
+      } else if (debug) {
+        return new Response(JSON.stringify({
+          ok:false, stage:"awards/lookup", status:r.status,
+          error:"Lookup failed", upstream: raw?.slice(0,400)
+        }), { status: 502, headers: { ...headers, "Content-Type":"application/json" } });
+      }
+    } catch {}
+  }
+
+  if (!award_id) {
+    return new Response(JSON.stringify({
+      ok:false, error:`No award found for PIID ${piid}`
+    }), { status: 404, headers: { ...headers, "Content-Type":"application/json" } });
+  }
+
+  // ---------- 3) Award metadata ----------
+  const metaRes = await fetch(
+    `https://api.usaspending.gov/api/v2/awards/${encodeURIComponent(award_id)}/`,
+    { headers: { accept: "application/json", "user-agent": apiHeaders["user-agent"] },
+      cf: { cacheTtl: 900, cacheEverything: false } }
+  );
+  const metaRead = await readJSON(metaRes);
+  if (!metaRes.ok || !metaRead.json) {
+    return new Response(JSON.stringify({
+      ok:false, error:`Meta failed: ${metaRes.status}`,
+      ...(debug ? { upstream: metaRead.raw?.slice(0,400) } : {})
+    }), { status: 502, headers: { ...headers, "Content-Type":"application/json" } });
+  }
+  const meta = metaRead.json;
+
+  // ---------- 4) Transactions (mods / obligations) ----------
+  const txRes = await fetch(
+    `https://api.usaspending.gov/api/v2/awards/${encodeURIComponent(award_id)}/transactions/?page=1&limit=500`,
+    { headers: { accept: "application/json", "user-agent": apiHeaders["user-agent"] },
+      cf: { cacheTtl: 900, cacheEverything: false } }
+  );
+  const txRead = await readJSON(txRes);
+  if (!txRes.ok || !txRead.json) {
+    return new Response(JSON.stringify({
+      ok:false, error:`Transactions failed: ${txRes.status}`,
+      ...(debug ? { upstream: txRead.raw?.slice(0,400) } : {})
+    }), { status: 502, headers: { ...headers, "Content-Type":"application/json" } });
+  }
+
+  const transactions = Array.isArray(txRead.json?.results) ? txRead.json.results : [];
+  const spendPoints = transactions.map((r) => ({
+    date: r.action_date,
+    obligation: Number(r.federal_action_obligation || 0),
+    mod: r.modification_number ?? "",
+    type: r.type || ""
+  }));
+
+  return new Response(JSON.stringify({
+    ok: true,
+    piid, award_id,
+    meta: {
+      pop_start: meta?.period_of_performance_start_date || null,
+      pop_current_end: meta?.period_of_performance_current_end_date || null,
+      pop_potential_end: meta?.period_of_performance_potential_end_date || null,
+      current_total_value_of_award: meta?.current_total_value_of_award ?? null,
+      potential_total_value_of_award: meta?.potential_total_value_of_award ?? null
+    },
+    spendPoints
+  }), { status: 200, headers: { ...headers, "Content-Type":"application/json" } });
+}
     /* -----------------------------------------------------------
        contract-summary  (UI alias -> usa-contract.meta)
        ----------------------------------------------------------- */
