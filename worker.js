@@ -205,9 +205,7 @@ export default {
           { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
         );
       } finally {
-        try {
-          await client.end();
-        } catch {}
+               try { await client.end(); } catch {}
       }
     }
 
@@ -219,7 +217,7 @@ export default {
       const agencyFilter = (url.searchParams.get("agency") || "").trim();
       const windowDays = Math.max(
         1,
-        Math.min(365, parseInt(url.searchParams.get("window_days") || "180", 10))
+               Math.min(365, parseInt(url.searchParams.get("window_days") || "180", 10))
       );
       const limit = Math.max(
         1,
@@ -293,9 +291,7 @@ export default {
           { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
         );
       } finally {
-        try {
-          await client.end();
-        } catch {}
+        try { await client.end(); } catch {}
       }
     }
 
@@ -360,9 +356,7 @@ export default {
           { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
         );
       } finally {
-        try {
-          await client.end();
-        } catch {}
+        try { await client.end(); } catch {}
       }
     }
 
@@ -558,194 +552,153 @@ export default {
           { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
         );
       } finally {
-        try {
-          await client.end();
-        } catch {}
+        try { await client.end(); } catch {}
       }
     }
 
     /* ---- usa-contract (USAspending-only; resilient Nov 2025) ---- */
-if (last === "usa-contract") {
-  const piid  = (url.searchParams.get("piid")  || "").trim().toUpperCase();
-  const debug = (url.searchParams.get("debug") || "") === "1";
-  if (!piid) {
-    return new Response(JSON.stringify({ ok:false, error:"Missing piid" }), {
-      status: 400, headers: { ...headers, "Content-Type":"application/json" }
-    });
-  }
+    if (last === "usa-contract") {
+      const piid  = (url.searchParams.get("piid")  || "").trim().toUpperCase();
+      const debug = (url.searchParams.get("debug") || "") === "1";
+      if (!piid) {
+        return new Response(JSON.stringify({ ok:false, error:"Missing piid" }), {
+          status: 400, headers: { ...headers, "Content-Type":"application/json" }
+        });
+      }
 
-  // Edge cache (15m)
-  const cache = caches.default;
-  const cacheKey = new Request(url.toString(), request);
-  const cached = await cache.match(cacheKey);
-  if (cached) {
-    return withCors(
-      cached,
-      { ...headers, "Cache-Control": "public, s-maxage=900, stale-while-revalidate=86400" }
-    );
-  }
+      // Edge cache (15m)
+      const cache = caches.default;
+      const cacheKey = new Request(url.toString(), request);
+      const cached = await cache.match(cacheKey);
+      if (cached) {
+        return withCors(
+          cached,
+          { ...headers, "Cache-Control": "public, s-maxage=900, stale-while-revalidate=86400" }
+        );
+      }
 
-  // Browser-like headers only (keeps WAF happy, even from Worker)
-  const USAS_HEADERS_JSON = {
-    accept: "application/json",
-    "content-type": "application/json",
-    origin: "https://www.usaspending.gov",
-    referer: "https://www.usaspending.gov/",
-    "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119 Safari/537.36",
-  };
-  const USAS_HEADERS_GET = {
-    accept: "application/json",
-    "user-agent": USAS_HEADERS_JSON["user-agent"],
-  };
-
-  // Small helpers
-  async function readJSON(res) {
-    const txt = await res.text();
-    try { return { json: JSON.parse(txt), raw: txt }; }
-    catch { return { json: null, raw: txt }; }
-  }
-  const dbg = (stage, res, raw, msg, code=502) =>
-    new Response(JSON.stringify({
-      ok:false, stage, status: res?.status ?? code, error: msg,
-      ...(debug ? { upstream: (raw||"").slice(0,400) } : {})
-    }), { status: code, headers: { ...headers, "Content-Type":"application/json" } });
-
-  // --------- Resolve generated_unique_award_id via keywords search ----------
-  async function resolveAwardId(piid) {
-    const USAS_URL = "https://api.usaspending.gov/api/v2/search/spending_by_award/";
-    const variants = Array.from(new Set([
-      piid,
-      String(piid).toUpperCase(),
-      String(piid).replace(/[\s\-]/g, "").toUpperCase(),
-    ]));
-
-    for (const v of variants) {
-      const body = {
-        filters: { keywords: [v] },               // robust in 2025
-        fields: ["Award ID","PIID"],
-        page: 1, limit: 25,
-        sort: "period_of_performance_start_date", order: "desc",
+      // Browser-like headers only (keeps WAF happy, even from Worker)
+      const USAS_HEADERS_JSON = {
+        accept: "application/json",
+        "content-type": "application/json",
+        origin: "https://www.usaspending.gov",
+        referer: "https://www.usaspending.gov/",
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119 Safari/537.36",
       };
-      const r = await fetch(USAS_URL, {
-        method: "POST",
-        headers: USAS_HEADERS_JSON,
-        body: JSON.stringify(body),
-        cf: { cacheTtl: 900, cacheEverything: false },
-      });
-      const { json, raw } = await readJSON(r);
-      if (!r.ok || !Array.isArray(json?.results) || json.results.length === 0) continue;
+      const USAS_HEADERS_GET = {
+        accept: "application/json",
+        "user-agent": USAS_HEADERS_JSON["user-agent"],
+      };
 
-      const exact = json.results.find(x =>
-        String(x?.PIID || x?.piid || "").toUpperCase() === String(piid).toUpperCase()
+      // Small helpers
+      async function readJSON(res) {
+        const txt = await res.text();
+        try { return { json: JSON.parse(txt), raw: txt }; }
+        catch { return { json: null, raw: txt }; }
+      }
+      const dbg = (stage, res, raw, msg, code=502) =>
+        new Response(JSON.stringify({
+          ok:false, stage, status: res?.status ?? code, error: msg,
+          ...(debug ? { upstream: (raw||"").slice(0,400) } : {})
+        }), { status: code, headers: { ...headers, "Content-Type":"application/json" } });
+
+      // --------- Resolve generated_unique_award_id via keywords search ----------
+      async function resolveAwardId(piid) {
+        const USAS_URL = "https://api.usaspending.gov/api/v2/search/spending_by_award/";
+        const variants = Array.from(new Set([
+          piid,
+          String(piid).toUpperCase(),
+          String(piid).replace(/[\s\-]/g, "").toUpperCase(),
+        ]));
+
+        for (const v of variants) {
+          const body = {
+            filters: { keywords: [v] },               // robust in 2025
+            fields: ["Award ID","PIID"],
+            page: 1, limit: 25,
+            sort: "period_of_performance_start_date", order: "desc",
+          };
+          const r = await fetch(USAS_URL, {
+            method: "POST",
+            headers: USAS_HEADERS_JSON,
+            body: JSON.stringify(body),
+            cf: { cacheTtl: 900, cacheEverything: false },
+          });
+          const { json, raw } = await readJSON(r);
+          if (!r.ok || !Array.isArray(json?.results) || json.results.length === 0) continue;
+
+          const exact = json.results.find(x =>
+            String(x?.PIID || x?.piid || "").toUpperCase() === String(piid).toUpperCase()
+          );
+          const first = exact || json.results[0];
+
+          const award_id =
+            first?.["Award ID"] ||
+            first?.generated_unique_award_id ||
+            first?.award_id ||
+            null;
+
+          if (award_id) return award_id;
+        }
+        return null;
+      }
+
+      const award_id = await resolveAwardId(piid);
+      if (!award_id) {
+        return new Response(JSON.stringify({ ok:false, error:`No award found for PIID ${piid}` }), {
+          status: 404, headers: { ...headers, "Content-Type":"application/json" }
+        });
+      }
+
+      // --------- Award metadata ----------
+      const metaRes = await fetch(
+        `https://api.usaspending.gov/api/v2/awards/${encodeURIComponent(award_id)}/`,
+        { headers: USAS_HEADERS_GET, cf: { cacheTtl: 900, cacheEverything: false } }
       );
-      const first = exact || json.results[0];
+      const metaRd = await readJSON(metaRes);
+      if (!metaRes.ok || !metaRd.json) return dbg("awards/{id}", metaRes, metaRd.raw, "Meta request failed");
 
-      const award_id =
-        first?.["Award ID"] ||
-        first?.generated_unique_award_id ||
-        first?.award_id ||
-        null;
+      // --------- Transactions (mods) ----------
+      const txRes = await fetch(
+        `https://api.usaspending.gov/api/v2/awards/${encodeURIComponent(award_id)}/transactions/?page=1&limit=500`,
+        { headers: USAS_HEADERS_GET, cf: { cacheTtl: 900, cacheEverything: false } }
+      );
+      const txRd = await readJSON(txRes);
+      if (!txRes.ok || !txRd.json) return dbg("awards/{id}/transactions", txRes, txRd.raw, "Transactions request failed");
 
-      if (award_id) return award_id;
+      const spendPoints = (Array.isArray(txRd.json?.results) ? txRd.json.results : []).map(r => ({
+        date: r.action_date,
+        obligation: Number(r.federal_action_obligation || 0),
+        mod: r.modification_number ?? "",
+        type: r.action_type_description || "",
+        description: r.description || ""
+      }));
+
+      // Compose response
+      const meta = metaRd.json;
+      const res = new Response(JSON.stringify({
+        ok: true,
+        piid, award_id,
+        meta: {
+          pop_start: meta?.period_of_performance_start_date || null,
+          pop_current_end: meta?.period_of_performance_current_end_date || null,
+          pop_potential_end: meta?.period_of_performance_potential_end_date || null,
+          current_total_value_of_award: meta?.current_total_value_of_award ?? null,
+          potential_total_value_of_award: meta?.potential_total_value_of_award ?? null,
+        },
+        spendPoints,
+      }), {
+        status: 200,
+        headers: {
+          ...headers,
+          "Content-Type": "application/json",
+          "Cache-Control": "public, s-maxage=900, stale-while-revalidate=86400",
+        },
+      });
+      ctx.waitUntil(cache.put(cacheKey, res.clone()));
+      return res;
     }
-    return null;
-  }
 
-  const award_id = await resolveAwardId(piid);
-  if (!award_id) {
-    return new Response(JSON.stringify({ ok:false, error:`No award found for PIID ${piid}` }), {
-      status: 404, headers: { ...headers, "Content-Type":"application/json" }
-    });
-  }
-
-  // --------- Award metadata ----------
-  const metaRes = await fetch(
-    `https://api.usaspending.gov/api/v2/awards/${encodeURIComponent(award_id)}/`,
-    { headers: USAS_HEADERS_GET, cf: { cacheTtl: 900, cacheEverything: false } }
-  );
-  const metaRd = await readJSON(metaRes);
-  if (!metaRes.ok || !metaRd.json) return dbg("awards/{id}", metaRes, metaRd.raw, "Meta request failed");
-
-  // --------- Transactions (mods) ----------
-  const txRes = await fetch(
-    `https://api.usaspending.gov/api/v2/awards/${encodeURIComponent(award_id)}/transactions/?page=1&limit=500`,
-    { headers: USAS_HEADERS_GET, cf: { cacheTtl: 900, cacheEverything: false } }
-  );
-  const txRd = await readJSON(txRes);
-  if (!txRes.ok || !txRd.json) return dbg("awards/{id}/transactions", txRes, txRd.raw, "Transactions request failed");
-
-  const spendPoints = (Array.isArray(txRd.json?.results) ? txRd.json.results : []).map(r => ({
-    date: r.action_date,
-    obligation: Number(r.federal_action_obligation || 0),
-    mod: r.modification_number ?? "",
-    type: r.action_type_description || "",
-    description: r.description || ""
-  }));
-
-  // Compose response
-  const meta = metaRd.json;
-  const res = new Response(JSON.stringify({
-    ok: true,
-    piid, award_id,
-    meta: {
-      pop_start: meta?.period_of_performance_start_date || null,
-      pop_current_end: meta?.period_of_performance_current_end_date || null,
-      pop_potential_end: meta?.period_of_performance_potential_end_date || null,
-      current_total_value_of_award: meta?.current_total_value_of_award ?? null,
-      potential_total_value_of_award: meta?.potential_total_value_of_award ?? null,
-    },
-    spendPoints,
-  }), {
-    status: 200,
-    headers: {
-      ...headers,
-      "Content-Type": "application/json",
-      "Cache-Control": "public, s-maxage=900, stale-while-revalidate=86400",
-    },
-  });
-  ctx.waitUntil(cache.put(cacheKey, res.clone()));
-  return res;
-}
-
-  // 3) Award metadata
-  const metaRes = await fetch(
-    `https://api.usaspending.gov/api/v2/awards/${encodeURIComponent(award_id)}/`,
-    { headers: USAS_HEADERS_GET, cf: { cacheTtl: 900, cacheEverything: false } }
-  );
-  const metaRd = await readJSON(metaRes);
-  if (!metaRes.ok || !metaRd.json) return dbg("awards/{id}", metaRes, metaRd.raw, "Meta request failed");
-  const meta = metaRd.json;
-
-  // 4) // Transactions (mods)
-const txRes = await fetch(
-  `https://api.usaspending.gov/api/v2/awards/${encodeURIComponent(award_id)}/transactions/?page=1&limit=500`,
-  { headers: USAS_HEADERS_GET, cf: { cacheTtl: 900, cacheEverything: false } }
-);
-const txRd = await readJSON(txRes);
-if (!txRes.ok || !txRd.json) return dbg("awards/{id}/transactions", txRes, txRd.raw, "Transactions request failed");
-
-// ⬇️ now include type + description
-const spendPoints = (Array.isArray(txRd.json?.results) ? txRd.json.results : []).map(r => ({
-  date: r.action_date,
-  obligation: Number(r.federal_action_obligation || 0),
-  mod: r.modification_number ?? "",
-  type: r.action_type_description || "",
-  description: r.description || ""
-}));
-
-  return new Response(JSON.stringify({
-    ok: true,
-    piid, award_id,
-    meta: {
-      pop_start: meta?.period_of_performance_start_date || null,
-      pop_current_end: meta?.period_of_performance_current_end_date || null,
-      pop_potential_end: meta?.period_of_performance_potential_end_date || null,
-      current_total_value_of_award: meta?.current_total_value_of_award ?? null,
-      potential_total_value_of_award: meta?.potential_total_value_of_award ?? null,
-    },
-    spendPoints,
-  }), { status: 200, headers: { ...headers, "Content-Type":"application/json" } });
-}
     /* -----------------------------------------------------------
        contract-summary  (UI alias -> usa-contract.meta)
        ----------------------------------------------------------- */
@@ -866,9 +819,7 @@ const spendPoints = (Array.isArray(txRd.json?.results) ? txRd.json.results : [])
           { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
         );
       } finally {
-        try {
-          await client.end();
-        } catch {}
+        try { await client.end(); } catch {}
       }
     }
 
@@ -1065,9 +1016,7 @@ const spendPoints = (Array.isArray(txRd.json?.results) ? txRd.json.results : [])
           { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
         );
       } finally {
-        try {
-          await client.end();
-        } catch {}
+        try { await client.end(); } catch {}
       }
     }
 
@@ -1227,9 +1176,7 @@ Executive Memo:
           const incUEI = r0.rows[0] && r0.rows[0].recipient_uei && r0.rows[0].recipient_uei.toUpperCase();
           if (incUEI) exclude.push(incUEI);
         } catch {} finally {
-          try {
-            await client0.end();
-          } catch {}
+          try { await client0.end(); } catch {}
         }
       }
 
@@ -1260,47 +1207,47 @@ Executive Memo:
           ORDER BY obligated ASC NULLS LAST, awards DESC
           LIMIT $5`;
 
-      const params = [naics || null, org || null, years, exclude.length ? exclude : ["__NONE__"], limit * 2];
-      const base = await queryPreferringFast(client, mkSQL, params);
+        const params = [naics || null, org || null, years, exclude.length ? exclude : ["__NONE__"], limit * 2];
+        const base = await queryPreferringFast(client, mkSQL, params);
 
-      const out = [];
-      for (const b of base.rows) {
-        const mkA = (t) => `
-          SELECT award_id_piid AS piid, fiscal_year, naics_code AS naics,
-                 title, total_dollars_obligated_num AS obligated
-          FROM ${t}
-          WHERE recipient_uei = $1
-            AND ($2::text IS NULL OR naics_code=$2)
-            AND (
-              $3::text IS NULL OR awarding_agency_name=$3
-              OR awarding_sub_agency_name=$3 OR awarding_office_name=$3
-            )
-          ORDER BY fiscal_year DESC, pop_current_end_date DESC NULLS LAST
-          LIMIT 3`;
-        const a = await queryPreferringFast(client, mkA, [b.uei, naics || null, org || null]);
-        const website = await fetchVendorWebsiteByUEI(b.uei, env);
-        out.push({
-          uei: b.uei,
-          name: b.name,
-          set_aside: null,
-          obligated: Number(b.obligated || 0),
-          recent_awards: (a.rows || []).map((r) => ({
-            piid: r.piid,
-            fiscal_year: Number(r.fiscal_year),
-            naics: r.naics,
-            title: r.title,
-            obligated: Number(r.obligated || 0),
-          })),
-          website,
-          contact: null,
+        const out = [];
+        for (const b of base.rows) {
+          const mkA = (t) => `
+            SELECT award_id_piid AS piid, fiscal_year, naics_code AS naics,
+                   title, total_dollars_obligated_num AS obligated
+            FROM ${t}
+            WHERE recipient_uei = $1
+              AND ($2::text IS NULL OR naics_code=$2)
+              AND (
+                $3::text IS NULL OR awarding_agency_name=$3
+                OR awarding_sub_agency_name=$3 OR awarding_office_name=$3
+              )
+            ORDER BY fiscal_year DESC, pop_current_end_date DESC NULLS LAST
+            LIMIT 3`;
+          const a = await queryPreferringFast(client, mkA, [b.uei, naics || null, org || null]);
+          const website = await fetchVendorWebsiteByUEI(b.uei, env);
+          out.push({
+            uei: b.uei,
+            name: b.name,
+            set_aside: null,
+            obligated: Number(b.obligated || 0),
+            recent_awards: (a.rows || []).map((r) => ({
+              piid: r.piid,
+              fiscal_year: Number(r.fiscal_year),
+              naics: r.naics,
+              title: r.title,
+              obligated: Number(r.obligated || 0),
+            })),
+            website,
+            contact: null,
+          });
+          if (out.length >= limit) break;
+        }
+
+        return new Response(JSON.stringify({ ok: true, rows: out }), {
+          status: 200,
+          headers: { ...headers, "Content-Type": "application/json" },
         });
-        if (out.length >= limit) break;
-      }
-
-      return new Response(JSON.stringify({ ok: true, rows: out }), {
-        status: 200,
-        headers: { ...headers, "Content-Type": "application/json" },
-      });
       } catch (e) {
         return new Response(
           JSON.stringify({ ok: false, error: (e && e.message) || "teaming failed" }),
