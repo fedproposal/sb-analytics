@@ -624,19 +624,18 @@ if (last === "usa-contract") {
         method: "POST",
         headers: USAS_HEADERS_JSON,
         body: JSON.stringify({
-          filters: {
-            award_id_strings: [piid],
-            award_type_codes: ["A","B","C","D","E","F","IDV_A","IDV_B","IDV_C","IDV_D","IDV_E"],
-          },
-          fields: [
-            "generated_unique_award_id","piid",
-            "period_of_performance_start_date",
-            "period_of_performance_current_end_date",
-            "period_of_performance_potential_end_date",
-            "current_total_value_of_award","potential_total_value_of_award",
-          ],
-          page: 1, limit: 5, sort: "period_of_performance_start_date", order: "desc",
-        }),
+  filters: {
+    keywords: [piid],
+    award_type_codes: [
+      "A","B","C","D",
+      "IDV_A","IDV_B",
+      "IDV_B_A","IDV_B_B","IDV_B_C",
+      "IDV_C","IDV_D","IDV_E"
+    ],
+  },
+  fields: ["Award ID"],
+  page: 1, limit: 5, sort: "period_of_performance_start_date", order: "desc",
+}),
         cf: { cacheTtl: 900, cacheEverything: false },
       });
       const { json, raw } = await readJSON(r);
