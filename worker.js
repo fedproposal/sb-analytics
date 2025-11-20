@@ -554,17 +554,17 @@ export default {
       }
     }
 
-    /* ---- usa-contract (USAS first; Neon fallback; includes mod comments) ---- */
+    /* ---- usa-contract (DB-first; no USAspending / WAF-proof) ---- */
 if (last === "usa-contract") {
-  const piid  = (url.searchParams.get("piid")  || "").trim().toUpperCase();
-  const debug = (url.searchParams.get("debug") || "") === "1";
+  const piid = (url.searchParams.get("piid") || "").trim().toUpperCase();
   if (!piid) {
-    return new Response(JSON.stringify({ ok:false, error:"Missing piid" }), {
-      status: 400, headers: { ...headers, "Content-Type":"application/json" }
+    return new Response(JSON.stringify({ ok: false, error: "Missing piid" }), {
+      status: 400,
+      headers: { ...headers, "Content-Type": "application/json" },
     });
   }
 
-  // Edge cache (15m)
+  // Cache at the edge for 15 minutes
   const cache = caches.default;
   const cacheKey = new Request(url.toString(), request);
   const cached = await cache.match(cacheKey);
@@ -575,70 +575,97 @@ if (last === "usa-contract") {
     );
   }
 
-  // Browser-y headers (sometimes help with WAF; harmless if ignored)
-  const USAS_HEADERS_JSON = {
-    accept: "application/json",
-    "content-type": "application/json",
-    origin: "https://www.usaspending.gov",
-    referer: "https://www.usaspending.gov/",
-    "user-agent":
-      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119 Safari/537.36",
-  };
-  const USAS_HEADERS_GET = {
-    accept: "application/json",
-    "user-agent": USAS_HEADERS_JSON["user-agent"],
-  };
+  const client = makeClient(env);
+  try {
+    await client.connect();
+    await client.query(`SET statement_timeout = '15s'`);
 
-  // Small helpers
-  async function readJSON(res) {
-    const txt = await res.text();
-    try { return { json: JSON.parse(txt), raw: txt }; }
-    catch { return { json: null, raw: txt }; }
-  }
-  const dbg = (stage, res, raw, msg, code=502) =>
-    ({ ok:false, stage, status: res?.status ?? code, error: msg,
-       ...(debug ? { upstream: (raw||"").slice(0,400) } : {}) });
+    // Summary from fp.contract_award_summary_v
+    const sumSQL = `
+      SELECT
+        piid,
+        pop_start,
+        pop_current_end,
+        pop_potential_end,
+        current_total_value_of_award_num,
+        potential_total_value_of_award_num
+      FROM fp.contract_award_summary_v
+      WHERE piid = $1
+      LIMIT 1
+    `;
 
-  // ---------- Award ID via keywords with 2025 DoD prefix variants ----------
-  async function resolveAwardId(piid) {
-    const USAS_URL = "https://api.usaspending.gov/api/v2/search/spending_by_award/";
-    const clean = String(piid).toUpperCase().replace(/[^A-Z0-9]/g, "");
-    const variants = [
-      clean,                            // H9240420C0008
-      clean.slice(0,6) + "-" + clean.slice(6), // H92404-20C0008
-      clean.slice(0,6) + " " + clean.slice(6), // H92404 20C0008
-    ];
+    // Transactions (mods) with per-mod comments from fp.contract_txn_min_v1
+    const txnSQL = `
+      SELECT
+        action_date,
+        obligation,
+        modification_number,
+        action_type,
+        transaction_description
+      FROM fp.contract_txn_min_v1
+      WHERE piid = $1
+      ORDER BY action_date ASC
+      LIMIT 5000
+    `;
 
-    for (const v of variants) {
-      const body = {
-        filters: { keywords: [v] },
-        fields: ["Award ID","PIID"],
-        limit: 10, page: 1
-      };
-      let r, rd;
-      try {
-        r = await fetch(USAS_URL, {
-          method: "POST",
-          headers: USAS_HEADERS_JSON,
-          body: JSON.stringify(body),
-          cf: { cacheTtl: 900, cacheEverything: false },
-        });
-        rd = await readJSON(r);
-      } catch (e) {
-        // network/WAF failure — try next variant
-        continue;
-      }
-      if (!r.ok || !Array.isArray(rd.json?.results) || rd.json.results.length === 0) continue;
+    const [sumRes, txnRes] = await Promise.all([
+      client.query(sumSQL, [piid]),
+      client.query(txnSQL, [piid]),
+    ]);
 
-      const exact = rd.json.results.find(x =>
-        String(x?.PIID || x?.piid || "").toUpperCase().replace(/[^A-Z0-9]/g,"") === clean
-      );
-      const first = exact || rd.json.results[0];
-      const award_id = first?.["Award ID"] || first?.generated_unique_award_id || null;
-      if (award_id) return award_id;
+    if (!sumRes.rowCount) {
+      return new Response(JSON.stringify({ ok: false, error: `No award found for PIID ${piid}` }), {
+        status: 404,
+        headers: { ...headers, "Content-Type": "application/json" },
+      });
     }
-    return null;
+
+    const s = sumRes.rows[0];
+
+    // Normalize transactions to the shape your frontend already expects
+    const spendPoints = (txnRes.rows || []).map((r) => ({
+      date: r.action_date ? new Date(r.action_date).toISOString().slice(0, 10) : null,
+      obligation: Number(r.obligation || 0),
+      mod: r.modification_number || "",
+      type: r.action_type || "",
+      description: r.transaction_description || "",
+    }));
+
+    const body = {
+      ok: true,
+      piid,
+      award_id: null, // not needed by the chart; leave null or join another table if you really want it
+      meta: {
+        pop_start: s.pop_start || null,
+        pop_current_end: s.pop_current_end || null,
+        pop_potential_end: s.pop_potential_end || null,
+        current_total_value_of_award: s.current_total_value_of_award_num ?? null,
+        potential_total_value_of_award: s.potential_total_value_of_award_num ?? null,
+      },
+      spendPoints,
+    };
+
+    const res = new Response(JSON.stringify(body), {
+      status: 200,
+      headers: {
+        ...headers,
+        "Content-Type": "application/json",
+        "Cache-Control": "public, s-maxage=900, stale-while-revalidate=86400",
+      },
+    });
+
+    // Store in edge cache
+    ctx.waitUntil(cache.put(cacheKey, res.clone()));
+    return res;
+  } catch (e) {
+    return new Response(JSON.stringify({ ok: false, error: (e && e.message) || "usa-contract failed" }), {
+      status: 500,
+      headers: { ...headers, "Content-Type": "application/json" },
+    });
+  } finally {
+    try { await client.end(); } catch {}
   }
+}
 
   // -------- Neon fallback helpers (mods + meta) --------
   async function neonModsForPIID(client, thePIID) {
