@@ -554,75 +554,277 @@ export default {
       }
     }
 
-    /* ---- usa-contract (USAS 2025-resilient: prefix-variant keywords + mods) ---- */
-    if (last === "usa-contract") {
-      const piid = (url.searchParams.get("piid") || "").trim().toUpperCase();
-      const forcedAwardId = (url.searchParams.get("award_id") || "").trim();
-      const debug = (url.searchParams.get("debug") || "") === "1";
-      const noCache = debug || (url.searchParams.get("nocache") === "1");
-      if (!piid && !forcedAwardId) {
-        return new Response(JSON.stringify({ ok: false, error: "Missing piid" }), {
-          status: 400,
-          headers: { ...headers, "Content-Type": "application/json" },
+    /* ---- usa-contract (USAS first; Neon fallback; includes mod comments) ---- */
+if (last === "usa-contract") {
+  const piid  = (url.searchParams.get("piid")  || "").trim().toUpperCase();
+  const debug = (url.searchParams.get("debug") || "") === "1";
+  if (!piid) {
+    return new Response(JSON.stringify({ ok:false, error:"Missing piid" }), {
+      status: 400, headers: { ...headers, "Content-Type":"application/json" }
+    });
+  }
+
+  // Edge cache (15m)
+  const cache = caches.default;
+  const cacheKey = new Request(url.toString(), request);
+  const cached = await cache.match(cacheKey);
+  if (cached) {
+    return withCors(
+      cached,
+      { ...headers, "Cache-Control": "public, s-maxage=900, stale-while-revalidate=86400" }
+    );
+  }
+
+  // Browser-y headers (sometimes help with WAF; harmless if ignored)
+  const USAS_HEADERS_JSON = {
+    accept: "application/json",
+    "content-type": "application/json",
+    origin: "https://www.usaspending.gov",
+    referer: "https://www.usaspending.gov/",
+    "user-agent":
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119 Safari/537.36",
+  };
+  const USAS_HEADERS_GET = {
+    accept: "application/json",
+    "user-agent": USAS_HEADERS_JSON["user-agent"],
+  };
+
+  // Small helpers
+  async function readJSON(res) {
+    const txt = await res.text();
+    try { return { json: JSON.parse(txt), raw: txt }; }
+    catch { return { json: null, raw: txt }; }
+  }
+  const dbg = (stage, res, raw, msg, code=502) =>
+    ({ ok:false, stage, status: res?.status ?? code, error: msg,
+       ...(debug ? { upstream: (raw||"").slice(0,400) } : {}) });
+
+  // ---------- Award ID via keywords with 2025 DoD prefix variants ----------
+  async function resolveAwardId(piid) {
+    const USAS_URL = "https://api.usaspending.gov/api/v2/search/spending_by_award/";
+    const clean = String(piid).toUpperCase().replace(/[^A-Z0-9]/g, "");
+    const variants = [
+      clean,                            // H9240420C0008
+      clean.slice(0,6) + "-" + clean.slice(6), // H92404-20C0008
+      clean.slice(0,6) + " " + clean.slice(6), // H92404 20C0008
+    ];
+
+    for (const v of variants) {
+      const body = {
+        filters: { keywords: [v] },
+        fields: ["Award ID","PIID"],
+        limit: 10, page: 1
+      };
+      let r, rd;
+      try {
+        r = await fetch(USAS_URL, {
+          method: "POST",
+          headers: USAS_HEADERS_JSON,
+          body: JSON.stringify(body),
+          cf: { cacheTtl: 900, cacheEverything: false },
         });
+        rd = await readJSON(r);
+      } catch (e) {
+        // network/WAF failure — try next variant
+        continue;
       }
+      if (!r.ok || !Array.isArray(rd.json?.results) || rd.json.results.length === 0) continue;
 
-      // Edge cache (15m) — skipped in debug/noCache
-      const cache = caches.default;
-      const cacheKey = new Request(url.toString(), request);
-      if (!noCache) {
-        const cached = await cache.match(cacheKey);
-        if (cached) {
-          return withCors(
-            cached,
-            { ...headers, "Cache-Control": "public, s-maxage=900, stale-while-revalidate=86400" }
-          );
-        }
-      }
+      const exact = rd.json.results.find(x =>
+        String(x?.PIID || x?.piid || "").toUpperCase().replace(/[^A-Z0-9]/g,"") === clean
+      );
+      const first = exact || rd.json.results[0];
+      const award_id = first?.["Award ID"] || first?.generated_unique_award_id || null;
+      if (award_id) return award_id;
+    }
+    return null;
+  }
 
-      // WAF-friendly headers
-      const USAS_HEADERS_JSON = {
-        accept: "application/json",
-        "content-type": "application/json",
-        origin: "https://www.usaspending.gov",
-        referer: "https://www.usaspending.gov/",
-        "user-agent":
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119 Safari/537.36",
-        "cache-control": "no-cache",
-        pragma: "no-cache",
+  // -------- Neon fallback helpers (mods + meta) --------
+  async function neonModsForPIID(client, thePIID) {
+    // Discover columns that exist, then build SQL safely
+    const colq = await client.query(
+      `SELECT lower(column_name) AS c
+       FROM information_schema.columns
+       WHERE table_schema='public' AND table_name='usaspending_contract_awards'`
+    );
+    const have = new Set((colq.rows || []).map(r => r.c));
+
+    function firstExisting(list) {
+      for (const c of list) if (have.has(c)) return c;
+      return null;
+    }
+
+    const COL_PIID = firstExisting(["award_id_piid","prime_award_piid","piid"]);
+    const COL_DATE = firstExisting(["action_date","action_dt","transaction_date"]);
+    const COL_AMT  = firstExisting([
+      "federal_action_obligation","transaction_obligated_amount",
+      "action_obligation","obligated_amount"
+    ]);
+    const COL_MOD  = firstExisting(["modification_number","mod_number","mod"]);
+    const COL_DESC = firstExisting([
+      "transaction_description","description","description_of_contract_requirement",
+      "prime_award_base_transaction_description","transaction_description_raw"
+    ]);
+    const COL_TYPE = firstExisting([
+      "action_type_description","action_type","type","action"
+    ]);
+
+    if (!COL_PIID || !COL_DATE || !COL_AMT) {
+      return { rows: [] };
+    }
+
+    const sql =
+      `SELECT
+         ${COL_DATE}::date AS action_date,
+         ${COL_AMT}::numeric AS obligation,
+         ${COL_MOD ? COL_MOD : "NULL"} AS modification_number,
+         ${COL_TYPE ? COL_TYPE : "NULL"} AS action_type_description,
+         ${COL_DESC ? COL_DESC : "NULL"} AS description
+       FROM public.usaspending_contract_awards
+       WHERE ${COL_PIID} = $1
+       ORDER BY ${COL_DATE} ASC, ${COL_MOD ? `${COL_MOD} NULLS LAST` : "1"}`;
+
+    return await client.query(sql, [thePIID]);
+  }
+
+  async function neonMetaForPIID(client, thePIID) {
+    // Prefer v3 (has explicit period_of_performance_* fields), then v2
+    const r3 = await client.query(
+      `SELECT
+         award_id_piid,
+         period_of_performance_start_date         AS pop_start,
+         period_of_performance_current_end_date   AS pop_current_end,
+         period_of_performance_potential_end_date AS pop_potential_end,
+         current_total_value_of_award_num         AS current_total_value_of_award,
+         potential_total_value_of_award_num       AS potential_total_value_of_award
+       FROM public.usaspending_awards_v3
+       WHERE award_id_piid = $1
+       ORDER BY action_date_date DESC NULLS LAST
+       LIMIT 1`,
+      [thePIID]
+    );
+    if (r3.rows?.length) return r3.rows[0];
+
+    const r2 = await client.query(
+      `SELECT
+         award_id_piid,
+         pop_start_date                   AS pop_start,
+         pop_current_end_date             AS pop_current_end,
+         pop_potential_end_date           AS pop_potential_end,
+         current_total_value_of_award_num AS current_total_value_of_award,
+         potential_total_value_of_award_num AS potential_total_value_of_award
+       FROM public.usaspending_awards_v2
+       WHERE award_id_piid = $1
+       ORDER BY pop_current_end_date DESC NULLS LAST
+       LIMIT 1`,
+      [thePIID]
+    );
+    return r2.rows?.[0] || null;
+  }
+
+  // ---------- Try USAS first ----------
+  let award_id = null, meta = null, spendPoints = null, usasTried = false;
+
+  try {
+    award_id = await resolveAwardId(piid);
+    if (award_id) {
+      usasTried = true;
+
+      // Award meta
+      const metaRes = await fetch(
+        `https://api.usaspending.gov/api/v2/awards/${encodeURIComponent(award_id)}/`,
+        { headers: USAS_HEADERS_GET, cf: { cacheTtl: 900, cacheEverything: false } }
+      );
+      const metaRd = await readJSON(metaRes);
+      if (!metaRes.ok || !metaRd.json) throw dbg("awards/{id}", metaRes, metaRd.raw, "Meta request failed");
+      meta = {
+        pop_start:        metaRd.json?.period_of_performance_start_date || null,
+        pop_current_end:  metaRd.json?.period_of_performance_current_end_date || null,
+        pop_potential_end:metaRd.json?.period_of_performance_potential_end_date || null,
+        current_total_value_of_award:  metaRd.json?.current_total_value_of_award ?? null,
+        potential_total_value_of_award:metaRd.json?.potential_total_value_of_award ?? null,
       };
-      const USAS_HEADERS_GET = {
-        accept: "application/json",
-        "user-agent": USAS_HEADERS_JSON["user-agent"],
-        "cache-control": "no-cache",
-        pragma: "no-cache",
+
+      // Transactions (mods)
+      const txRes = await fetch(
+        `https://api.usaspending.gov/api/v2/awards/${encodeURIComponent(award_id)}/transactions/?page=1&limit=500`,
+        { headers: USAS_HEADERS_GET, cf: { cacheTtl: 900, cacheEverything: false } }
+      );
+      const txRd = await readJSON(txRes);
+      if (!txRes.ok || !txRd.json) throw dbg("awards/{id}/transactions", txRes, txRd.raw, "Transactions request failed");
+
+      spendPoints = (Array.isArray(txRd.json?.results) ? txRd.json.results : []).map(r => ({
+        date: r.action_date,
+        obligation: Number(r.federal_action_obligation || 0),
+        mod: r.modification_number ?? "",
+        type: r.action_type_description || "",
+        description: r.description || r.transaction_description || ""
+      }));
+    }
+  } catch (_) {
+    // ignore; we’ll fall back to Neon
+  }
+
+  // ---------- Fallback to Neon if USAS failed or blocked ----------
+  if (!spendPoints || !meta) {
+    const client = makeClient(env);
+    try {
+      await client.connect();
+      await client.query(`SET statement_timeout = '20s'`);
+
+      // meta
+      const m = await neonMetaForPIID(client, piid);
+      // mods
+      const mods = await neonModsForPIID(client, piid);
+
+      meta = m || {
+        pop_start: null, pop_current_end: null, pop_potential_end: null,
+        current_total_value_of_award: null, potential_total_value_of_award: null
       };
 
-      function normPIID(s) {
-        return String(s || "").replace(/[^A-Za-z0-9]/g, "").toUpperCase();
-      }
+      spendPoints = (mods.rows || []).map(r => ({
+        date: r.action_date ? new Date(r.action_date).toISOString().slice(0,10) : null,
+        obligation: Number(r.obligation || 0),
+        mod: r.modification_number || "",
+        type: r.action_type_description || "",
+        description: r.description || ""
+      }));
 
-      async function readJSON(res) {
-        const txt = await res.text();
-        try {
-          return { json: JSON.parse(txt), raw: txt };
-        } catch {
-          return { json: null, raw: txt };
-        }
-      }
-      const dbg = (stage, res, raw, msg, code = 502, extra = {}) =>
-        new Response(
-          JSON.stringify({
-            ok: false,
-            stage,
-            status: res?.status ?? code,
-            error: msg,
-            ...extra,
-            ...(debug ? { upstream: (raw || "").slice(0, 400) } : {}),
-          }),
-          { status: code, headers: { ...headers, "Content-Type": "application/json" } }
-        );
+      // When USAS never responded, set a synthetic award_id so UI doesn’t look empty
+      if (!award_id) award_id = `NEON_${piid}`;
+    } catch (e) {
+      const payload = usasTried
+        ? { ok:false, error:"Both USAspending and Neon fallback failed", detail:String(e && e.message) }
+        : { ok:false, error:`No award found for PIID ${piid}` };
+      return new Response(JSON.stringify(payload), {
+        status: 502,
+        headers: { ...headers, "Content-Type":"application/json" }
+      });
+    } finally {
+      try { await client.end(); } catch {}
+    }
+  }
 
+  // Compose success
+  const out = {
+    ok: true,
+    piid, award_id,
+    meta,
+    spendPoints
+  };
+
+  const res = new Response(JSON.stringify(out), {
+    status: 200,
+    headers: {
+      ...headers,
+      "Content-Type": "application/json",
+      "Cache-Control": "public, s-maxage=900, stale-while-revalidate=86400",
+    },
+  });
+  ctx.waitUntil(cache.put(cacheKey, res.clone()));
+  return res;
+}
       // --------- Resolve generated_unique_award_id (prefix-aware variants) ----------
       async function resolveAwardId(piidValue) {
         if (forcedAwardId) {
