@@ -602,46 +602,103 @@ export default {
           ...(debug ? { upstream: (raw||"").slice(0,400) } : {})
         }), { status: code, headers: { ...headers, "Content-Type":"application/json" } });
 
-      // --------- Resolve generated_unique_award_id via keywords search ----------
-      async function resolveAwardId(piid) {
-        const USAS_URL = "https://api.usaspending.gov/api/v2/search/spending_by_award/";
-        const variants = Array.from(new Set([
-          piid,
-          String(piid).toUpperCase(),
-          String(piid).replace(/[\s\-]/g, "").toUpperCase(),
-        ]));
+      // --------- Resolve generated_unique_award_id (2025 bulletproof) ----------
+async function resolveAwardId(piidValue) {
+  // Allow bypass via querystring (?award_id=...)
+  if (forcedAwardId) {
+    return { award_id: forcedAwardId, source: "querystring", attempts: [] };
+  }
 
-        for (const v of variants) {
-          const body = {
-            filters: { keywords: [v] },               // robust in 2025
-            fields: ["Award ID","PIID"],
-            page: 1, limit: 25,
-            sort: "period_of_performance_start_date", order: "desc",
-          };
-          const r = await fetch(USAS_URL, {
-            method: "POST",
-            headers: USAS_HEADERS_JSON,
-            body: JSON.stringify(body),
-            cf: { cacheTtl: 900, cacheEverything: false },
-          });
-          const { json, raw } = await readJSON(r);
-          if (!r.ok || !Array.isArray(json?.results) || json.results.length === 0) continue;
+  const USAS_URL = "https://api.usaspending.gov/api/v2/search/spending_by_award/";
+  const attempts = [];
 
-          const exact = json.results.find(x =>
-            String(x?.PIID || x?.piid || "").toUpperCase() === String(piid).toUpperCase()
-          );
-          const first = exact || json.results[0];
+  // 1) Primary: use award_id_strings to bypass keyword WAF
+  try {
+    const body = {
+      filters: {
+        award_id_strings: [piidValue],
+        // broad set to include contracts + IDVs
+        award_type_codes: ["A","B","C","D","E","F","IDV_A","IDV_B","IDV_B_A","IDV_C","IDV_D","IDV_E"]
+      },
+      fields: ["Award ID", "PIID"],
+      page: 1,
+      limit: 10
+    };
 
-          const award_id =
-            first?.["Award ID"] ||
-            first?.generated_unique_award_id ||
-            first?.award_id ||
-            null;
+    const r = await fetch(USAS_URL, {
+      method: "POST",
+      headers: USAS_HEADERS_JSON, // already defined above
+      body: JSON.stringify(body),
+      cf: { cacheTtl: 900, cacheEverything: false }
+    });
 
-          if (award_id) return award_id;
-        }
-        return null;
+    const { json, raw } = await readJSON(r);      // readJSON already defined above
+    const count = Array.isArray(json?.results) ? json.results.length : 0;
+    attempts.push({ method: "award_id_strings", status: r.status, count });
+
+    if (r.ok && count > 0) {
+      // prefer exact PIID match (case-insensitive), else take first
+      const exact = json.results.find(x =>
+        String(x?.PIID || x?.piid || "").toUpperCase() === String(piidValue).toUpperCase()
+      );
+      const first = exact || json.results[0];
+
+      const award_id =
+        first?.["Award ID"] ||
+        first?.generated_unique_award_id ||
+        first?.award_id ||
+        null;
+
+      if (award_id) {
+        return { award_id, source: "award_id_strings", attempts };
       }
+    }
+  } catch (e) {
+    attempts.push({ method: "award_id_strings", error: String(e?.message || e) });
+  }
+
+  // 2) Fallback: keywords (kept minimal; no hyphenation variants)
+  try {
+    const bodyKW = {
+      filters: { keywords: [String(piidValue).toUpperCase()] },
+      fields: ["Award ID", "PIID"],
+      page: 1,
+      limit: 25,
+      sort: "period_of_performance_start_date",
+      order: "desc"
+    };
+
+    const r2 = await fetch(USAS_URL, {
+      method: "POST",
+      headers: USAS_HEADERS_JSON,
+      body: JSON.stringify(bodyKW),
+      cf: { cacheTtl: 0, cacheEverything: false }
+    });
+    const { json: j2, raw: raw2 } = await readJSON(r2);
+    const count2 = Array.isArray(j2?.results) ? j2.results.length : 0;
+    attempts.push({ method: "keywords", status: r2.status, count: count2 });
+
+    if (r2.ok && count2 > 0) {
+      const up = String(piidValue).toUpperCase();
+      const exact = j2.results.find(x => String(x?.PIID || x?.piid || "").toUpperCase() === up);
+      const first = exact || j2.results[0];
+
+      const award_id =
+        first?.["Award ID"] ||
+        first?.generated_unique_award_id ||
+        first?.award_id ||
+        null;
+
+      if (award_id) {
+        return { award_id, source: "keywords", attempts };
+      }
+    }
+  } catch (e) {
+    attempts.push({ method: "keywords", error: String(e?.message || e) });
+  }
+
+  return { award_id: null, source: "resolve", attempts };
+}
 
       const award_id = await resolveAwardId(piid);
       if (!award_id) {
