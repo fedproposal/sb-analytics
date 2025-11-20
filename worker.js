@@ -1,13 +1,17 @@
-// worker.js — sb-analytics (fast probe + resilient USAspending + teaming)
-// VERSION: sb-usa-v3-2025-11-19c
+// worker.js — sb-analytics (DB-first, no direct USAspending from Worker)
+// Uses Neon/Hyperdrive views you created:
+//   - fp.contract_txn_min_v1           (mods/transactions + comments)
+//   - fp.contract_award_summary_v      (award summary/meta)
+//
+// Notes:
+// - CORS-friendly, edge-cached responses
+// - Keeps existing routes (agencies, expiring-contracts, vendor-awards, insights, etc.)
 
 import { Client } from "pg";
 
 /* =====================================================================
    C O R S
    ===================================================================== */
-const WORKER_VERSION = "sb-usa-v3-2025-11-19c";
-
 function cors(origin, env) {
   const list = (env && env.CORS_ALLOW_ORIGINS ? env.CORS_ALLOW_ORIGINS : "")
     .split(",")
@@ -25,7 +29,6 @@ function cors(origin, env) {
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
     "Access-Control-Max-Age": "86400",
     Vary: "Origin",
-    "x-sb-version": WORKER_VERSION,
   };
 }
 function withCors(res, headers) {
@@ -44,9 +47,13 @@ function makeClient(env) {
     connectionTimeoutMillis: 15000,
   });
 }
-const TBL_FAST = "public.usaspending_awards_fast";
-const TBL_V2 = "public.usaspending_awards_v2";
 
+// These two were used by some routes; keep them if your fast view exists.
+// They are NOT used by /sb/usa-contract in this version.
+const TBL_FAST = "public.usaspending_awards_fast";
+const TBL_V2   = "public.usaspending_awards_v2";
+
+/** Probe the materialized view safely; ok if you don’t have it. */
 async function preferFast(client) {
   try {
     const r = await client.query(
@@ -58,6 +65,7 @@ async function preferFast(client) {
     const populated =
       r.rows && r.rows[0] && (r.rows[0].ispopulated === true || r.rows[0].ispopulated === "t");
     if (!populated) return false;
+
     await client.query(`SET LOCAL statement_timeout = '1500ms'`);
     await client.query(`SELECT 1 FROM ${TBL_FAST} LIMIT 1`);
     return true;
@@ -65,6 +73,8 @@ async function preferFast(client) {
     return false;
   }
 }
+
+/** Prefer FAST when available; otherwise fall back to v2. */
 async function queryPreferringFast(client, mkSQL, params) {
   const useFast = await preferFast(client);
   const sql = mkSQL(useFast ? TBL_FAST : TBL_V2);
@@ -133,7 +143,6 @@ export default {
     const origin = request.headers.get("Origin") || "";
     const headers = cors(origin, env);
 
-    // CORS preflight
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers });
     }
@@ -141,19 +150,15 @@ export default {
     const segments = url.pathname.split("/").filter(Boolean);
     const last = segments[segments.length - 1] || "";
 
-    /* -----------------------------------------------------------
-       health
-       ----------------------------------------------------------- */
+    /* -------------------- health -------------------- */
     if (last === "health") {
-      return new Response(JSON.stringify({ ok: true, version: WORKER_VERSION }), {
+      return new Response(JSON.stringify({ ok: true }), {
         status: 200,
         headers: { ...headers, "Content-Type": "application/json" },
       });
     }
 
-    /* -----------------------------------------------------------
-       agencies  (cached 24h)
-       ----------------------------------------------------------- */
+    /* -------------------- agencies (cached 24h) -------------------- */
     if (last === "agencies") {
       const cache = caches.default;
       const cacheKey = new Request(url.toString(), request);
@@ -195,30 +200,17 @@ export default {
           { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
         );
       } finally {
-        try {
-          await client.end();
-        } catch {}
+        try { await client.end(); } catch {}
       }
     }
 
-    /* -----------------------------------------------------------
-       expiring-contracts  (cached 5m)
-       ----------------------------------------------------------- */
+    /* -------------------- expiring-contracts (cached 5m) -------------------- */
     if (last === "expiring-contracts") {
       const naicsParam = (url.searchParams.get("naics") || "").trim();
       const agencyFilter = (url.searchParams.get("agency") || "").trim();
-      const windowDays = Math.max(
-        1,
-        Math.min(365, parseInt(url.searchParams.get("window_days") || "180", 10))
-      );
-      const limit = Math.max(
-        1,
-        Math.min(200, parseInt(url.searchParams.get("limit") || "100", 10))
-      );
-
-      const naicsList = naicsParam
-        ? naicsParam.split(",").map((s) => s.trim()).filter(Boolean)
-        : [];
+      const windowDays = Math.max(1, Math.min(365, parseInt(url.searchParams.get("window_days") || "180", 10)));
+      const limit = Math.max(1, Math.min(200, parseInt(url.searchParams.get("limit") || "100", 10)));
+      const naicsList = naicsParam ? naicsParam.split(",").map((s) => s.trim()).filter(Boolean) : [];
 
       const cache = caches.default;
       const cacheKey = new Request(url.toString(), request);
@@ -234,7 +226,6 @@ export default {
       try {
         await client.connect();
         await client.query(`SET statement_timeout = '20s'`);
-
         const mkSQL = (table) => `
           SELECT
             award_id_piid           AS piid,
@@ -258,13 +249,7 @@ export default {
             )
           ORDER BY pop_current_end_date ASC
           LIMIT $4`;
-
-        const params = [
-          windowDays,
-          agencyFilter || null,
-          naicsList.length ? naicsList : null,
-          limit,
-        ];
+        const params = [windowDays, agencyFilter || null, naicsList.length ? naicsList : null, limit];
         const { rows } = await queryPreferringFast(client, mkSQL, params);
 
         const res = new Response(JSON.stringify({ ok: true, rows }), {
@@ -283,15 +268,11 @@ export default {
           { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
         );
       } finally {
-        try {
-          await client.end();
-        } catch {}
+        try { await client.end(); } catch {}
       }
     }
 
-    /* -----------------------------------------------------------
-       vendor-awards  (left-pane list)
-       ----------------------------------------------------------- */
+    /* -------------------- vendor-awards (left pane list) -------------------- */
     if (last === "vendor-awards") {
       const uei = (url.searchParams.get("uei") || "").trim();
       const agency = (url.searchParams.get("agency") || "").trim();
@@ -299,12 +280,11 @@ export default {
       const limit = Math.max(1, Math.min(300, parseInt(url.searchParams.get("limit") || "100", 10)));
       if (!uei) {
         return new Response(JSON.stringify({ ok: false, error: "Missing uei" }), {
-          status: 400,
-          headers: { ...headers, "Content-Type": "application/json" },
+          status: 400, headers: { ...headers, "Content-Type": "application/json" },
         });
       }
 
-      const mkSQL = (table) => `
+      const mkSQL = (t) => `
         SELECT
           award_id_piid            AS piid,
           fiscal_year,
@@ -318,7 +298,7 @@ export default {
           extent_competed,
           number_of_offers_received,
           total_dollars_obligated_num AS obligated
-        FROM ${table}
+        FROM ${t}
         WHERE recipient_uei = $1
           AND (
             $2::text IS NULL
@@ -334,15 +314,9 @@ export default {
       try {
         await client.connect();
         await client.query(`SET statement_timeout = '20s'`);
-        const { rows } = await queryPreferringFast(client, mkSQL, [
-          uei,
-          agency || null,
-          years,
-          limit,
-        ]);
+        const { rows } = await queryPreferringFast(client, mkSQL, [uei, agency || null, years, limit]);
         return new Response(JSON.stringify({ ok: true, rows }), {
-          status: 200,
-          headers: { ...headers, "Content-Type": "application/json" },
+          status: 200, headers: { ...headers, "Content-Type": "application/json" },
         });
       } catch (e) {
         return new Response(
@@ -350,25 +324,18 @@ export default {
           { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
         );
       } finally {
-        try {
-          await client.end();
-        } catch {}
+        try { await client.end(); } catch {}
       }
     }
 
-    /* -----------------------------------------------------------
-       contracts/insights  (POST, cached 10m)
-       ----------------------------------------------------------- */
+    /* -------------------- contracts/insights (POST, cached 10m) -------------------- */
     if (request.method === "POST" && url.pathname.toLowerCase().endsWith("/contracts/insights")) {
       const bodyTxt = await request.clone().text();
       let piid = "";
-      try {
-        piid = (JSON.parse(bodyTxt).piid || "").trim().toUpperCase();
-      } catch {}
+      try { piid = (JSON.parse(bodyTxt).piid || "").trim().toUpperCase(); } catch {}
       if (!piid) {
         return new Response(JSON.stringify({ ok: false, error: "Missing piid" }), {
-          status: 400,
-          headers: { ...headers, "Content-Type": "application/json" },
+          status: 400, headers: { ...headers, "Content-Type": "application/json" },
         });
       }
       const cache = caches.default;
@@ -386,7 +353,7 @@ export default {
         await client.connect();
         await client.query(`SET statement_timeout = '20s'`);
 
-        const mkSQL = (table) => `
+        const mkSQL = (t) => `
           SELECT
             award_id_piid,
             awarding_agency_name,
@@ -406,7 +373,7 @@ export default {
             number_of_offers_received,
             extent_competed,
             title
-          FROM ${table}
+          FROM ${t}
           WHERE award_id_piid = $1
           ORDER BY pop_current_end_date DESC
           LIMIT 1`;
@@ -414,8 +381,7 @@ export default {
         const aRes = await queryPreferringFast(client, mkSQL, [piid]);
         if (!aRes.rows.length) {
           return new Response(JSON.stringify({ ok: false, error: "No award found for that PIID." }), {
-            status: 404,
-            headers: { ...headers, "Content-Type": "application/json" },
+            status: 404, headers: { ...headers, "Content-Type": "application/json" },
           });
         }
         const a = aRes.rows[0];
@@ -430,37 +396,19 @@ export default {
           : a.pop_current_end_date
           ? new Date(a.pop_current_end_date)
           : null;
-        let burnPct = null,
-          stage = "unknown",
-          label = "Lifecycle insight limited",
-          windowLabel = "Window unknown";
+
+        let burnPct = null, stage = "unknown", label = "Lifecycle insight limited", windowLabel = "Window unknown";
         if (ceiling && ceiling > 0) burnPct = Math.round((obligated / ceiling) * 100);
         if (start && end && end > start) {
           const now = Date.now();
           const t = end.getTime() - start.getTime();
           const e = Math.min(Math.max(now, start.getTime()), end.getTime()) - start.getTime();
           const pct = Math.round((e / t) * 100);
-          if (now < start.getTime()) {
-            stage = "not_started";
-            label = "Not started yet";
-            windowLabel = "Window not opened";
-          } else if (now > end.getTime()) {
-            stage = "complete";
-            label = "Performance complete";
-            windowLabel = "Window passed";
-          } else if (pct < 25) {
-            stage = "early";
-            label = "Early stage";
-            windowLabel = "In performance window";
-          } else if (pct < 75) {
-            stage = "mid";
-            label = "Mid-stage";
-            windowLabel = "In performance window";
-          } else {
-            stage = "late";
-            label = "Late / near end";
-            windowLabel = "In performance window";
-          }
+          if (now < start.getTime()) { stage = "not_started"; label = "Not started yet"; windowLabel = "Window not opened"; }
+          else if (now > end.getTime()) { stage = "complete"; label = "Performance complete"; windowLabel = "Window passed"; }
+          else if (pct < 25) { stage = "early"; label = "Early stage"; windowLabel = "In performance window"; }
+          else if (pct < 75) { stage = "mid"; label = "Mid-stage"; windowLabel = "In performance window"; }
+          else { stage = "late"; label = "Late / near end"; windowLabel = "In performance window"; }
         }
 
         // Subs (best-effort)
@@ -513,13 +461,9 @@ export default {
         if (website) primary.website = website;
 
         const lifecycle = {
-          stage,
-          label,
-          windowLabel,
-          timeElapsedPct: null,
-          burnPct,
-          primeVsSubsPct: null,
-          largestSubPct: null,
+          stage, label, windowLabel,
+          timeElapsedPct: null, burnPct,
+          primeVsSubsPct: null, largestSubPct: null,
         };
 
         const res = new Response(
@@ -548,445 +492,113 @@ export default {
           { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
         );
       } finally {
-        try {
-          await client.end();
-        } catch {}
+        try { await client.end(); } catch {}
       }
     }
 
-    /* ---- usa-contract (DB-first; no USAspending / WAF-proof) ---- */
-if (last === "usa-contract") {
-  const piid = (url.searchParams.get("piid") || "").trim().toUpperCase();
-  if (!piid) {
-    return new Response(JSON.stringify({ ok: false, error: "Missing piid" }), {
-      status: 400,
-      headers: { ...headers, "Content-Type": "application/json" },
-    });
-  }
+    /* -------------------- usa-contract (DB-backed, resilient) -------------------- */
+    if (last === "usa-contract") {
+      const piid = (url.searchParams.get("piid") || "").trim().toUpperCase();
+      if (!piid) {
+        return new Response(JSON.stringify({ ok: false, error: "Missing piid" }), {
+          status: 400, headers: { ...headers, "Content-Type": "application/json" },
+        });
+      }
 
-  // Cache at the edge for 15 minutes
-  const cache = caches.default;
-  const cacheKey = new Request(url.toString(), request);
-  const cached = await cache.match(cacheKey);
-  if (cached) {
-    return withCors(
-      cached,
-      { ...headers, "Cache-Control": "public, s-maxage=900, stale-while-revalidate=86400" }
-    );
-  }
-
-  const client = makeClient(env);
-  try {
-    await client.connect();
-    await client.query(`SET statement_timeout = '15s'`);
-
-    // Summary from fp.contract_award_summary_v
-    const sumSQL = `
-      SELECT
-        piid,
-        pop_start,
-        pop_current_end,
-        pop_potential_end,
-        current_total_value_of_award_num,
-        potential_total_value_of_award_num
-      FROM fp.contract_award_summary_v
-      WHERE piid = $1
-      LIMIT 1
-    `;
-
-    // Transactions (mods) with per-mod comments from fp.contract_txn_min_v1
-    const txnSQL = `
-      SELECT
-        action_date,
-        obligation,
-        modification_number,
-        action_type,
-        transaction_description
-      FROM fp.contract_txn_min_v1
-      WHERE piid = $1
-      ORDER BY action_date ASC
-      LIMIT 5000
-    `;
-
-    const [sumRes, txnRes] = await Promise.all([
-      client.query(sumSQL, [piid]),
-      client.query(txnSQL, [piid]),
-    ]);
-
-    if (!sumRes.rowCount) {
-      return new Response(JSON.stringify({ ok: false, error: `No award found for PIID ${piid}` }), {
-        status: 404,
-        headers: { ...headers, "Content-Type": "application/json" },
-      });
-    }
-
-    const s = sumRes.rows[0];
-
-    // Normalize transactions to the shape your frontend already expects
-    const spendPoints = (txnRes.rows || []).map((r) => ({
-      date: r.action_date ? new Date(r.action_date).toISOString().slice(0, 10) : null,
-      obligation: Number(r.obligation || 0),
-      mod: r.modification_number || "",
-      type: r.action_type || "",
-      description: r.transaction_description || "",
-    }));
-
-    const body = {
-      ok: true,
-      piid,
-      award_id: null, // not needed by the chart; leave null or join another table if you really want it
-      meta: {
-        pop_start: s.pop_start || null,
-        pop_current_end: s.pop_current_end || null,
-        pop_potential_end: s.pop_potential_end || null,
-        current_total_value_of_award: s.current_total_value_of_award_num ?? null,
-        potential_total_value_of_award: s.potential_total_value_of_award_num ?? null,
-      },
-      spendPoints,
-    };
-
-    const res = new Response(JSON.stringify(body), {
-      status: 200,
-      headers: {
-        ...headers,
-        "Content-Type": "application/json",
-        "Cache-Control": "public, s-maxage=900, stale-while-revalidate=86400",
-      },
-    });
-
-    // Store in edge cache
-    ctx.waitUntil(cache.put(cacheKey, res.clone()));
-    return res;
-  } catch (e) {
-    return new Response(JSON.stringify({ ok: false, error: (e && e.message) || "usa-contract failed" }), {
-      status: 500,
-      headers: { ...headers, "Content-Type": "application/json" },
-    });
-  } finally {
-    try { await client.end(); } catch {}
-  }
-}
-
-  // -------- Neon fallback helpers (mods + meta) --------
-  async function neonModsForPIID(client, thePIID) {
-    // Discover columns that exist, then build SQL safely
-    const colq = await client.query(
-      `SELECT lower(column_name) AS c
-       FROM information_schema.columns
-       WHERE table_schema='public' AND table_name='usaspending_contract_awards'`
-    );
-    const have = new Set((colq.rows || []).map(r => r.c));
-
-    function firstExisting(list) {
-      for (const c of list) if (have.has(c)) return c;
-      return null;
-    }
-
-    const COL_PIID = firstExisting(["award_id_piid","prime_award_piid","piid"]);
-    const COL_DATE = firstExisting(["action_date","action_dt","transaction_date"]);
-    const COL_AMT  = firstExisting([
-      "federal_action_obligation","transaction_obligated_amount",
-      "action_obligation","obligated_amount"
-    ]);
-    const COL_MOD  = firstExisting(["modification_number","mod_number","mod"]);
-    const COL_DESC = firstExisting([
-      "transaction_description","description","description_of_contract_requirement",
-      "prime_award_base_transaction_description","transaction_description_raw"
-    ]);
-    const COL_TYPE = firstExisting([
-      "action_type_description","action_type","type","action"
-    ]);
-
-    if (!COL_PIID || !COL_DATE || !COL_AMT) {
-      return { rows: [] };
-    }
-
-    const sql =
-      `SELECT
-         ${COL_DATE}::date AS action_date,
-         ${COL_AMT}::numeric AS obligation,
-         ${COL_MOD ? COL_MOD : "NULL"} AS modification_number,
-         ${COL_TYPE ? COL_TYPE : "NULL"} AS action_type_description,
-         ${COL_DESC ? COL_DESC : "NULL"} AS description
-       FROM public.usaspending_contract_awards
-       WHERE ${COL_PIID} = $1
-       ORDER BY ${COL_DATE} ASC, ${COL_MOD ? `${COL_MOD} NULLS LAST` : "1"}`;
-
-    return await client.query(sql, [thePIID]);
-  }
-
-  async function neonMetaForPIID(client, thePIID) {
-    // Prefer v3 (has explicit period_of_performance_* fields), then v2
-    const r3 = await client.query(
-      `SELECT
-         award_id_piid,
-         period_of_performance_start_date         AS pop_start,
-         period_of_performance_current_end_date   AS pop_current_end,
-         period_of_performance_potential_end_date AS pop_potential_end,
-         current_total_value_of_award_num         AS current_total_value_of_award,
-         potential_total_value_of_award_num       AS potential_total_value_of_award
-       FROM public.usaspending_awards_v3
-       WHERE award_id_piid = $1
-       ORDER BY action_date_date DESC NULLS LAST
-       LIMIT 1`,
-      [thePIID]
-    );
-    if (r3.rows?.length) return r3.rows[0];
-
-    const r2 = await client.query(
-      `SELECT
-         award_id_piid,
-         pop_start_date                   AS pop_start,
-         pop_current_end_date             AS pop_current_end,
-         pop_potential_end_date           AS pop_potential_end,
-         current_total_value_of_award_num AS current_total_value_of_award,
-         potential_total_value_of_award_num AS potential_total_value_of_award
-       FROM public.usaspending_awards_v2
-       WHERE award_id_piid = $1
-       ORDER BY pop_current_end_date DESC NULLS LAST
-       LIMIT 1`,
-      [thePIID]
-    );
-    return r2.rows?.[0] || null;
-  }
-
-  // ---------- Try USAS first ----------
-  let award_id = null, meta = null, spendPoints = null, usasTried = false;
-
-  try {
-    award_id = await resolveAwardId(piid);
-    if (award_id) {
-      usasTried = true;
-
-      // Award meta
-      const metaRes = await fetch(
-        `https://api.usaspending.gov/api/v2/awards/${encodeURIComponent(award_id)}/`,
-        { headers: USAS_HEADERS_GET, cf: { cacheTtl: 900, cacheEverything: false } }
-      );
-      const metaRd = await readJSON(metaRes);
-      if (!metaRes.ok || !metaRd.json) throw dbg("awards/{id}", metaRes, metaRd.raw, "Meta request failed");
-      meta = {
-        pop_start:        metaRd.json?.period_of_performance_start_date || null,
-        pop_current_end:  metaRd.json?.period_of_performance_current_end_date || null,
-        pop_potential_end:metaRd.json?.period_of_performance_potential_end_date || null,
-        current_total_value_of_award:  metaRd.json?.current_total_value_of_award ?? null,
-        potential_total_value_of_award:metaRd.json?.potential_total_value_of_award ?? null,
-      };
-
-      // Transactions (mods)
-      const txRes = await fetch(
-        `https://api.usaspending.gov/api/v2/awards/${encodeURIComponent(award_id)}/transactions/?page=1&limit=500`,
-        { headers: USAS_HEADERS_GET, cf: { cacheTtl: 900, cacheEverything: false } }
-      );
-      const txRd = await readJSON(txRes);
-      if (!txRes.ok || !txRd.json) throw dbg("awards/{id}/transactions", txRes, txRd.raw, "Transactions request failed");
-
-      spendPoints = (Array.isArray(txRd.json?.results) ? txRd.json.results : []).map(r => ({
-        date: r.action_date,
-        obligation: Number(r.federal_action_obligation || 0),
-        mod: r.modification_number ?? "",
-        type: r.action_type_description || "",
-        description: r.description || r.transaction_description || ""
-      }));
-    }
-  } catch (_) {
-    // ignore; we’ll fall back to Neon
-  }
-
-  // ---------- Fallback to Neon if USAS failed or blocked ----------
-  if (!spendPoints || !meta) {
-    const client = makeClient(env);
-    try {
-      await client.connect();
-      await client.query(`SET statement_timeout = '20s'`);
-
-      // meta
-      const m = await neonMetaForPIID(client, piid);
-      // mods
-      const mods = await neonModsForPIID(client, piid);
-
-      meta = m || {
-        pop_start: null, pop_current_end: null, pop_potential_end: null,
-        current_total_value_of_award: null, potential_total_value_of_award: null
-      };
-
-      spendPoints = (mods.rows || []).map(r => ({
-        date: r.action_date ? new Date(r.action_date).toISOString().slice(0,10) : null,
-        obligation: Number(r.obligation || 0),
-        mod: r.modification_number || "",
-        type: r.action_type_description || "",
-        description: r.description || ""
-      }));
-
-      // When USAS never responded, set a synthetic award_id so UI doesn’t look empty
-      if (!award_id) award_id = `NEON_${piid}`;
-    } catch (e) {
-      const payload = usasTried
-        ? { ok:false, error:"Both USAspending and Neon fallback failed", detail:String(e && e.message) }
-        : { ok:false, error:`No award found for PIID ${piid}` };
-      return new Response(JSON.stringify(payload), {
-        status: 502,
-        headers: { ...headers, "Content-Type":"application/json" }
-      });
-    } finally {
-      try { await client.end(); } catch {}
-    }
-  }
-
-  // Compose success
-  const out = {
-    ok: true,
-    piid, award_id,
-    meta,
-    spendPoints
-  };
-
-  const res = new Response(JSON.stringify(out), {
-    status: 200,
-    headers: {
-      ...headers,
-      "Content-Type": "application/json",
-      "Cache-Control": "public, s-maxage=900, stale-while-revalidate=86400",
-    },
-  });
-  ctx.waitUntil(cache.put(cacheKey, res.clone()));
-  return res;
-}
-      // --------- Resolve generated_unique_award_id (prefix-aware variants) ----------
-      async function resolveAwardId(piidValue) {
-        if (forcedAwardId) {
-          return { award_id: forcedAwardId, source: "querystring", attempts: [] };
-        }
-
-        const USAS_URL = "https://api.usaspending.gov/api/v2/search/spending_by_award/";
-        const clean = normPIID(piidValue);
-        const variants = Array.from(
-          new Set([
-            clean,
-            clean.length > 6 ? clean.slice(0, 6) + "-" + clean.slice(6) : clean,
-            clean.length > 6 ? clean.slice(0, 6) + " " + clean.slice(6) : clean,
-          ])
+      // Edge cache (15m)
+      const cache = caches.default;
+      const cacheKey = new Request(url.toString(), request);
+      const cached = await cache.match(cacheKey);
+      if (cached) {
+        return withCors(
+          cached,
+          { ...headers, "Cache-Control": "public, s-maxage=900, stale-while-revalidate=86400" }
         );
-
-        const attempts = [];
-        for (const v of variants) {
-          const body = {
-            filters: { keywords: [v] },
-            fields: ["Award ID", "PIID"],
-            page: 1,
-            limit: 10,
-          };
-          const r = await fetch(USAS_URL, {
-            method: "POST",
-            headers: USAS_HEADERS_JSON,
-            body: JSON.stringify(body),
-            cf: { cacheTtl: 900, cacheEverything: false },
-          });
-          const { json, raw } = await readJSON(r);
-          const count = Array.isArray(json?.results) ? json.results.length : 0;
-          attempts.push({ variant: v, status: r.status, count });
-
-          if (!r.ok || count === 0) continue;
-
-          const exact =
-            json.results.find(
-              (x) =>
-                normPIID(x?.PIID || x?.piid || "") === clean
-            ) || null;
-          const first = exact || json.results[0];
-
-          const award_id =
-            first?.["Award ID"] ||
-            first?.generated_unique_award_id ||
-            first?.award_id ||
-            null;
-
-          if (award_id) return { award_id, source: "keywords_variant", attempts };
-        }
-        return { award_id: null, source: "resolve", attempts, tried_variants: variants };
       }
 
-      const { award_id, source, attempts, tried_variants } = await resolveAwardId(piid);
-      if (!award_id) {
+      const client = makeClient(env);
+      try {
+        await client.connect();
+        await client.query(`SET statement_timeout = '20s'`);
+
+        // Summary/meta
+        const sumSQL = `
+          SELECT
+            piid,
+            pop_start          AS pop_start,
+            pop_current_end    AS pop_current_end,
+            pop_potential_end  AS pop_potential_end,
+            current_total_value_of_award_num      AS current_total_value_of_award,
+            potential_total_value_of_award_num    AS potential_total_value_of_award
+          FROM fp.contract_award_summary_v
+          WHERE piid = $1
+          LIMIT 1`;
+        const sumRes = await client.query(sumSQL, [piid]);
+        if (!sumRes.rows.length) {
+          return new Response(
+            JSON.stringify({ ok: false, error: `No award found for PIID ${piid}` }),
+            { status: 404, headers: { ...headers, "Content-Type": "application/json" } }
+          );
+        }
+        const s = sumRes.rows[0];
+
+        // Transactions/mods (+ comments)
+        const txSQL = `
+          SELECT action_date, obligation, modification_number, action_type, transaction_description
+          FROM fp.contract_txn_min_v1
+          WHERE piid = $1
+          ORDER BY action_date ASC
+          LIMIT 5000`;
+        const txRes = await client.query(txSQL, [piid]);
+
+        const spendPoints = (txRes.rows || []).map((r) => ({
+          date: r.action_date ? String(r.action_date) : null,
+          obligation: Number(r.obligation || 0),
+          mod: r.modification_number || "",
+          type: r.action_type || "",
+          description: r.transaction_description || "",
+        }));
+
+        const payload = {
+          ok: true,
+          piid,
+          award_id: null, // not available from DB views; keep null for shape compatibility
+          meta: {
+            pop_start: s.pop_start || null,
+            pop_current_end: s.pop_current_end || null,
+            pop_potential_end: s.pop_potential_end || null,
+            current_total_value_of_award: s.current_total_value_of_award ?? null,
+            potential_total_value_of_award: s.potential_total_value_of_award ?? null,
+          },
+          spendPoints,
+        };
+
+        const res = new Response(JSON.stringify(payload), {
+          status: 200,
+          headers: {
+            ...headers,
+            "Content-Type": "application/json",
+            "Cache-Control": "public, s-maxage=900, stale-while-revalidate=86400",
+          },
+        });
+        ctx.waitUntil(cache.put(cacheKey, res.clone()));
+        return res;
+      } catch (e) {
         return new Response(
-          JSON.stringify({
-            ok: false,
-            stage: "resolve/keywords",
-            status: 404,
-            error: `No award found for PIID ${piid}`,
-            ...(debug ? { attempts, tried_variants } : {}),
-          }),
-          { status: 404, headers: { ...headers, "Content-Type": "application/json" } }
+          JSON.stringify({ ok: false, error: (e && e.message) || "usa-contract failed" }),
+          { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
         );
+      } finally {
+        try { await client.end(); } catch {}
       }
-
-      // --------- Award metadata ----------
-      const metaRes = await fetch(
-        `https://api.usaspending.gov/api/v2/awards/${encodeURIComponent(award_id)}/`,
-        { headers: USAS_HEADERS_GET, cf: { cacheTtl: 0, cacheEverything: false } }
-      );
-      const metaRd = await readJSON(metaRes);
-      if (!metaRes.ok || !metaRd.json)
-        return dbg("awards/{id}", metaRes, metaRd.raw, "Meta request failed");
-
-      // --------- Transactions (mods) ----------
-      const txRes = await fetch(
-        `https://api.usaspending.gov/api/v2/awards/${encodeURIComponent(award_id)}/transactions/?page=1&limit=500`,
-        { headers: USAS_HEADERS_GET, cf: { cacheTtl: 0, cacheEverything: false } }
-      );
-      const txRd = await readJSON(txRes);
-      if (!txRes.ok || !txRd.json)
-        return dbg("awards/{id}/transactions", txRes, txRd.raw, "Transactions request failed");
-
-      const spendPoints = (Array.isArray(txRd.json?.results) ? txRd.json.results : []).map((r) => ({
-        date: r.action_date,
-        obligation: Number(r.federal_action_obligation || 0),
-        mod: r.modification_number ?? "",
-        type: r.action_type_description || "",
-        description: r.description || "",
-      }));
-
-      const meta = metaRd.json;
-      const payload = {
-        ok: true,
-        version: WORKER_VERSION,
-        piid,
-        award_id,
-        resolver: source,
-        ...(debug ? { attempts, tried_variants } : {}),
-        meta: {
-          pop_start: meta?.period_of_performance_start_date || null,
-          pop_current_end: meta?.period_of_performance_current_end_date || null,
-          pop_potential_end: meta?.period_of_performance_potential_end_date || null,
-          current_total_value_of_award: meta?.current_total_value_of_award ?? null,
-          potential_total_value_of_award: meta?.potential_total_value_of_award ?? null,
-        },
-        spendPoints,
-      };
-
-      const res = new Response(JSON.stringify(payload), {
-        status: 200,
-        headers: {
-          ...headers,
-          "Content-Type": "application/json",
-          ...(noCache
-            ? { "Cache-Control": "no-store" }
-            : { "Cache-Control": "public, s-maxage=900, stale-while-revalidate=86400" }),
-        },
-      });
-      if (!noCache) ctx.waitUntil(cache.put(cacheKey, res.clone()));
-      return res;
     }
 
-    /* -----------------------------------------------------------
-       contract-summary  (UI alias -> usa-contract.meta)
-       ----------------------------------------------------------- */
+    /* -------------------- contract-summary (alias -> usa-contract.meta) -------------------- */
     if (last === "contract-summary") {
       const piid = (url.searchParams.get("piid") || "").trim().toUpperCase();
       if (!piid) {
         return new Response(JSON.stringify({ ok: false, error: "Missing piid" }), {
-          status: 400,
-          headers: { ...headers, "Content-Type": "application/json" },
+          status: 400, headers: { ...headers, "Content-Type": "application/json" },
         });
       }
       const r = await fetch(`${url.origin}/sb/usa-contract?piid=${encodeURIComponent(piid)}`);
@@ -1012,15 +624,12 @@ if (last === "usa-contract") {
       );
     }
 
-    /* -----------------------------------------------------------
-       contracts/activity  (UI alias -> usa-contract.spendPoints)
-       ----------------------------------------------------------- */
+    /* -------------------- contracts/activity (alias -> usa-contract.spendPoints) -------------------- */
     if (segments.length >= 2 && segments[segments.length - 2] === "contracts" && last === "activity") {
       const piid = (url.searchParams.get("piid") || "").trim().toUpperCase();
       if (!piid) {
         return new Response(JSON.stringify({ ok: false, error: "Missing piid" }), {
-          status: 400,
-          headers: { ...headers, "Content-Type": "application/json" },
+          status: 400, headers: { ...headers, "Content-Type": "application/json" },
         });
       }
       const r = await fetch(`${url.origin}/sb/usa-contract?piid=${encodeURIComponent(piid)}`);
@@ -1035,22 +644,20 @@ if (last === "usa-contract") {
         date: p.date,
         federal_action_obligation: p.obligation,
         modification_number: p.mod,
+        action_type: p.type || null,
+        transaction_description: p.description || null,
       }));
       return new Response(JSON.stringify({ ok: true, points, results: points }), {
-        status: 200,
-        headers: { ...headers, "Content-Type": "application/json" },
+        status: 200, headers: { ...headers, "Content-Type": "application/json" },
       });
     }
 
-    /* -----------------------------------------------------------
-       my-entity
-       ----------------------------------------------------------- */
+    /* -------------------- my-entity -------------------- */
     if (last === "my-entity") {
       const uei = (url.searchParams.get("uei") || "").trim().toUpperCase();
       if (!uei) {
         return new Response(JSON.stringify({ ok: false, error: "Missing uei parameter." }), {
-          status: 400,
-          headers: { ...headers, "Content-Type": "application/json" },
+          status: 400, headers: { ...headers, "Content-Type": "application/json" },
         });
       }
 
@@ -1098,15 +705,11 @@ if (last === "usa-contract") {
           { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
         );
       } finally {
-        try {
-          await client.end();
-        } catch {}
+        try { await client.end(); } catch {}
       }
     }
 
-    /* -----------------------------------------------------------
-       bid-nobid
-       ----------------------------------------------------------- */
+    /* -------------------- bid-nobid (numeric scorer) -------------------- */
     if (last === "bid-nobid") {
       const piid = (url.searchParams.get("piid") || "").trim().toUpperCase();
       const uei = (url.searchParams.get("uei") || "").trim().toUpperCase();
@@ -1242,8 +845,8 @@ if (last === "usa-contract") {
         if (knownSA > 0) {
           if (example.includes("SDVOSB") && haveMatch("SDVOSB")) comp = 5;
           else if (example.includes("WOSB") && haveMatch("WOSB")) comp = 5;
-          else if (example.includes("HUB") && haveMatch("HUB")) comp = 5;
-          else if (example.includes("8(A)") && (haveMatch("8(A)") || haveMatch("8A"))) comp = 5;
+          else if (example.includes("HUB")) comp = 5;
+          else if (example.includes("8(A)") || example.includes("8A")) comp = 5;
           else comp = 2;
         }
         let price = 3;
@@ -1297,15 +900,11 @@ if (last === "usa-contract") {
           { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
         );
       } finally {
-        try {
-          await client.end();
-        } catch {}
+        try { await client.end(); } catch {}
       }
     }
 
-    /* -----------------------------------------------------------
-       bid-nobid-memo
-       ----------------------------------------------------------- */
+    /* -------------------- bid-nobid-memo -------------------- */
     if (last === "bid-nobid-memo") {
       const piid = (url.searchParams.get("piid") || "").trim().toUpperCase();
       const uei = (url.searchParams.get("uei") || "").trim().toUpperCase();
@@ -1313,8 +912,7 @@ if (last === "usa-contract") {
 
       if (!piid || !uei) {
         return new Response(JSON.stringify({ ok: false, error: "Missing piid or uei" }), {
-          status: 400,
-          headers: { ...headers, "Content-Type": "application/json" },
+          status: 400, headers: { ...headers, "Content-Type": "application/json" },
         });
       }
 
@@ -1332,8 +930,7 @@ if (last === "usa-contract") {
 
       if (!env.OPENAI_API_KEY) {
         return new Response(JSON.stringify({ ok: false, error: "OPENAI_API_KEY not set" }), {
-          status: 500,
-          headers: { ...headers, "Content-Type": "application/json" },
+          status: 500, headers: { ...headers, "Content-Type": "application/json" },
         });
       }
 
@@ -1345,12 +942,8 @@ if (last === "usa-contract") {
       const pct = String(j.weighted_percent ?? "—");
 
       const NON_MENTION_SETASIDES = new Set([
-        "NONE",
-        "N/A",
-        "FULL AND OPEN",
-        "FULL & OPEN",
-        "FULL AND OPEN COMPETITION",
-        "UNRESTRICTED",
+        "NONE", "N/A", "FULL AND OPEN", "FULL & OPEN",
+        "FULL AND OPEN COMPETITION", "UNRESTRICTED",
       ]);
 
       const lines = (j.criteria || [])
@@ -1392,10 +985,7 @@ Executive Memo:
 
       const aiRes = await fetch("https://api.openai.com/v1/chat/completions", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${env.OPENAI_API_KEY}`,
-        },
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${env.OPENAI_API_KEY}` },
         body: JSON.stringify({
           model: "gpt-4.1-mini",
           messages: [
@@ -1409,29 +999,19 @@ Executive Memo:
 
       const txt = await aiRes.text();
       let memo = "";
-      try {
-        memo = JSON.parse(txt).choices[0].message.content.trim() || "";
-      } catch {
-        memo = txt.slice(0, 3000);
-      }
+      try { memo = JSON.parse(txt).choices[0].message.content.trim() || ""; }
+      catch { memo = txt.slice(0, 3000); }
 
       return new Response(JSON.stringify({ ok: true, ...j, memo }), {
-        status: 200,
-        headers: { ...headers, "Content-Type": "application/json" },
+        status: 200, headers: { ...headers, "Content-Type": "application/json" },
       });
     }
 
-    /* -----------------------------------------------------------
-       Teaming Intelligence
-       ----------------------------------------------------------- */
+    /* -------------------- teaming-suggestions -------------------- */
     if (last === "teaming-suggestions") {
       let qp = {};
       if (request.method === "POST") {
-        try {
-          qp = await request.json();
-        } catch {
-          qp = {};
-        }
+        try { qp = await request.json(); } catch { qp = {}; }
       } else {
         const params = new URL(request.url).searchParams;
         qp = Object.fromEntries(params.entries());
@@ -1442,9 +1022,7 @@ Executive Memo:
       const years = Math.max(1, Math.min(10, parseInt(qp.years || "3", 10)));
       const limit = Math.max(3, Math.min(10, parseInt(qp.limit || "5", 10)));
       const exclude = String(qp.exclude_ueis || "")
-        .split(",")
-        .map((s) => s.trim().toUpperCase())
-        .filter(Boolean);
+        .split(",").map((s) => s.trim().toUpperCase()).filter(Boolean);
 
       if (piid) {
         const client0 = makeClient(env);
@@ -1456,9 +1034,7 @@ Executive Memo:
           const incUEI = r0.rows[0] && r0.rows[0].recipient_uei && r0.rows[0].recipient_uei.toUpperCase();
           if (incUEI) exclude.push(incUEI);
         } catch {} finally {
-          try {
-            await client0.end();
-          } catch {}
+          try { await client0.end(); } catch {}
         }
       }
 
@@ -1527,8 +1103,7 @@ Executive Memo:
         }
 
         return new Response(JSON.stringify({ ok: true, rows: out }), {
-          status: 200,
-          headers: { ...headers, "Content-Type": "application/json" },
+          status: 200, headers: { ...headers, "Content-Type": "application/json" },
         });
       } catch (e) {
         return new Response(
@@ -1540,9 +1115,7 @@ Executive Memo:
       }
     }
 
-    /* -----------------------------------------------------------
-       SAM.gov Opportunities proxy — /opportunities/search  (GET/POST)
-       ----------------------------------------------------------- */
+    /* -------------------- SAM.gov Opportunities proxy -------------------- */
     const SAM_ALLOWED_TYPES = new Set([
       "Solicitation",
       "Combined Synopsis/Solicitation",
@@ -1553,10 +1126,7 @@ Executive Memo:
     ]);
     function coerceTypes(input) {
       let types = Array.isArray(input) ? input : String(input || "").split(",");
-      types = types
-        .map((s) => String(s || "").trim())
-        .filter(Boolean)
-        .filter((t) => SAM_ALLOWED_TYPES.has(t));
+      types = types.map((s) => String(s || "").trim()).filter(Boolean).filter((t) => SAM_ALLOWED_TYPES.has(t));
       if (types.length === 0) types = ["Solicitation"];
       return types;
     }
@@ -1572,9 +1142,7 @@ Executive Memo:
       const yyyy = d.getFullYear();
       return `${mm}/${dd}/${yyyy}`;
     }
-    function isMDY(s) {
-      return /^\d{2}\/\d{2}\/\d{4}$/.test(String(s || ""));
-    }
+    function isMDY(s) { return /^\d{2}\/\d{2}\/\d{4}$/.test(String(s || "")); }
     function buildSamURL(env, body) {
       const u = new URL("https://api.sam.gov/prod/opportunities/v2/search");
       if (!env.SAM_API_KEY) throw new Error("SAM_API_KEY is not configured");
@@ -1584,16 +1152,8 @@ Executive Memo:
       const now = new Date();
       const from = new Date(now.getTime() - days * 86400000);
 
-      const postedFrom = isMDY(body.postedFrom)
-        ? body.postedFrom
-        : isMDY(body.posted_from)
-        ? body.posted_from
-        : fmtMDY(from);
-      const postedTo = isMDY(body.postedTo)
-        ? body.postedTo
-        : isMDY(body.posted_to)
-        ? body.posted_to
-        : fmtMDY(now);
+      const postedFrom = isMDY(body.postedFrom) ? body.postedFrom : isMDY(body.posted_from) ? body.posted_from : fmtMDY(from);
+      const postedTo   = isMDY(body.postedTo)   ? body.postedTo   : isMDY(body.posted_to)   ? body.posted_to   : fmtMDY(now);
 
       u.searchParams.set("postedFrom", postedFrom);
       u.searchParams.set("postedTo", postedTo);
@@ -1605,14 +1165,9 @@ Executive Memo:
         u.searchParams.append("naics", code);
       }
 
-      const q =
-        body.q || body.keyword || body.keywords || body.search || body.searchText || body.searchTerm || "";
-      const org =
-        body.agency_contains || body.agency || body.agencyName || body.organization || body.org || body.fullParentPathName || "";
-      const mergedKeyword = [q, org]
-        .map((s) => String(s || "").trim())
-        .filter(Boolean)
-        .join(" ");
+      const q   = body.q || body.keyword || body.keywords || body.search || body.searchText || body.searchTerm || "";
+      const org = body.agency_contains || body.agency || body.agencyName || body.organization || body.org || body.fullParentPathName || "";
+      const mergedKeyword = [q, org].map((s) => String(s || "").trim()).filter(Boolean).join(" ");
       if (mergedKeyword) u.searchParams.set("keyword", mergedKeyword);
 
       const setAsideRaw = body.setAside || body.setAsideCodes || body.typeOfSetAside || body.type_of_set_aside;
@@ -1622,7 +1177,7 @@ Executive Memo:
         if (code) u.searchParams.set("setAsideCode", code);
       }
 
-      const limit = Math.max(1, Math.min(100, parseInt(body.limit || "25", 10)));
+      const limit  = Math.max(1, Math.min(100, parseInt(body.limit  || "25", 10)));
       const offset = Math.max(0, parseInt(body.offset || "0", 10));
       u.searchParams.set("limit", String(limit));
       u.searchParams.set("offset", String(offset));
@@ -1637,11 +1192,7 @@ Executive Memo:
         let body = {};
         if (request.method === "POST") {
           const txt = await request.text();
-          try {
-            body = JSON.parse(txt);
-          } catch {
-            body = {};
-          }
+          try { body = JSON.parse(txt); } catch { body = {}; }
         } else {
           body = Object.fromEntries(new URL(request.url).searchParams.entries());
         }
@@ -1686,7 +1237,6 @@ Executive Memo:
             : Array.isArray(dataAny.opportunitiesData)
             ? dataAny.opportunitiesData
             : [];
-
           const totalRecords = j.totalRecords || j.total || (Array.isArray(opportunitiesData) ? opportunitiesData.length : 0);
           const limit = Number(j.limit || body.limit || 25) || 25;
           const offset = Number(j.offset || body.offset || 0) || 0;
@@ -1698,8 +1248,7 @@ Executive Memo:
         return new Response(JSON.stringify(normalized), { status: 200, headers: passHeaders });
       } catch (e) {
         return new Response(JSON.stringify({ ok: false, error: String((e && e.message) || e) }), {
-          status: 500,
-          headers: { ...headers, "Content-Type": "application/json" },
+          status: 500, headers: { ...headers, "Content-Type": "application/json" },
         });
       }
     }
