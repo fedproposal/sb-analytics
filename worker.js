@@ -218,14 +218,14 @@ export default {
         try { await client.end(); } catch {}
       }
     }
-     /* -------------------- SBA capabilities by UEI -------------------- */
-/* GET /sb/capabilities?my=<UEI>&inc=<UEI> */
-if (last === "capabilities") {
-  const my = (url.searchParams.get("my") || "").trim().toUpperCase();
-  const inc = (url.searchParams.get("inc") || "").trim().toUpperCase();
-  const ueis = [my, inc].filter(Boolean);
-  if (!ueis.length) {
-    return new Response(JSON.stringify({ ok: false, error: "missing UEI" }), {
+     /* -------------------- sba-caps (get capabilities narratives by UEI) -------------------- */
+// GET /sb/sba-caps?uei=<your UEI>&incumbentUei=<prime UEI>
+if (last === "sba-caps") {
+  const uei = (url.searchParams.get("uei") || "").trim().toUpperCase();
+  const incUei = (url.searchParams.get("incumbentUei") || "").trim().toUpperCase();
+
+  if (!uei) {
+    return new Response(JSON.stringify({ ok: false, error: "missing uei" }), {
       status: 400,
       headers: { ...headers, "Content-Type": "application/json" },
     });
@@ -234,27 +234,36 @@ if (last === "capabilities") {
   const client = makeClient(env);
   try {
     await client.connect();
-    await client.query(`SET statement_timeout = '10s'`);
-    const q = `
-      SELECT UPPER(uei) AS uei,
-             COALESCE(capabilities_narrative, '') AS narrative
-      FROM sba.smallbiz_v
-      WHERE UPPER(uei) = ANY($1::text[])
-      LIMIT 2;
-    `;
-    const { rows } = await client.query(q, [ueis]);
-    // Normalize to object keyed by UEI for simple lookups
-    const payload = {};
-    for (const r of rows) payload[r.uei] = r.narrative || "";
-    return new Response(JSON.stringify({ ok: true, data: payload }), {
+    await client.query(`SET statement_timeout = '15s'`);
+
+    // helper: fetch one row from the SBA view
+    const fetchOne = async (xUei) => {
+      if (!xUei) return null;
+      const q = `
+        SELECT
+          uei,
+          business_name,
+          NULLIF(TRIM(capabilities_narrative), '') AS capabilities_narrative
+        FROM sba.smallbiz_v
+        WHERE UPPER(uei) = $1
+        ORDER BY NULLIF(TRIM(last_updated_date), '') DESC NULLS LAST
+        LIMIT 1`;
+      const { rows } = await client.query(q, [xUei]);
+      return rows?.[0] || null;
+    };
+
+    const mine = await fetchOne(uei);
+    const incumbent = incUei ? await fetchOne(incUei) : null;
+
+    return new Response(JSON.stringify({ ok: true, mine, incumbent }), {
       status: 200,
       headers: { ...headers, "Content-Type": "application/json" },
     });
   } catch (e) {
-    return new Response(
-      JSON.stringify({ ok: false, error: (e && e.message) || "query failed" }),
-      { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
-    );
+    return new Response(JSON.stringify({ ok: false, error: e?.message || "query failed" }), {
+      status: 500,
+      headers: { ...headers, "Content-Type": "application/json" },
+    });
   } finally {
     try { await client.end(); } catch {}
   }
