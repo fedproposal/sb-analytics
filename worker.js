@@ -218,6 +218,47 @@ export default {
         try { await client.end(); } catch {}
       }
     }
+     /* -------------------- SBA capabilities by UEI -------------------- */
+/* GET /sb/capabilities?my=<UEI>&inc=<UEI> */
+if (last === "capabilities") {
+  const my = (url.searchParams.get("my") || "").trim().toUpperCase();
+  const inc = (url.searchParams.get("inc") || "").trim().toUpperCase();
+  const ueis = [my, inc].filter(Boolean);
+  if (!ueis.length) {
+    return new Response(JSON.stringify({ ok: false, error: "missing UEI" }), {
+      status: 400,
+      headers: { ...headers, "Content-Type": "application/json" },
+    });
+  }
+
+  const client = makeClient(env);
+  try {
+    await client.connect();
+    await client.query(`SET statement_timeout = '10s'`);
+    const q = `
+      SELECT UPPER(uei) AS uei,
+             COALESCE(capabilities_narrative, '') AS narrative
+      FROM sba.smallbiz_v
+      WHERE UPPER(uei) = ANY($1::text[])
+      LIMIT 2;
+    `;
+    const { rows } = await client.query(q, [ueis]);
+    // Normalize to object keyed by UEI for simple lookups
+    const payload = {};
+    for (const r of rows) payload[r.uei] = r.narrative || "";
+    return new Response(JSON.stringify({ ok: true, data: payload }), {
+      status: 200,
+      headers: { ...headers, "Content-Type": "application/json" },
+    });
+  } catch (e) {
+    return new Response(
+      JSON.stringify({ ok: false, error: (e && e.message) || "query failed" }),
+      { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
+    );
+  } finally {
+    try { await client.end(); } catch {}
+  }
+}
     /* -------------------- SBA capabilities (mine + incumbent) -------------------- */
     if (last === "sba-caps") {
       const uei = (url.searchParams.get("uei") || "").toUpperCase().trim();
