@@ -255,6 +255,8 @@ export default {
       award_key                             AS award_key,
       awarding_agency_name                  AS agency,
       naics_code                            AS naics,
+      /* NEW: incumbent name */
+    COALESCE(NULLIF(recipient_name,''), NULL) AS incumbent,
       pop_current_end_date                  AS end_date,
       potential_total_value_of_award_num    AS value,
       recipient_name,
