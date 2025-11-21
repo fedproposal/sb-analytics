@@ -268,6 +268,129 @@ if (last === "sba-caps") {
     try { await client.end(); } catch {}
   }
 }
+     /* -------------------- capabilities compare (server-side, stable) -------------------- */
+/*
+  POST /sb/cap-compare
+  Body: { my: "<UEI>", inc: "<UEI|null>", txDescs?: string[] }
+  Returns: SBA narratives for both UEIs (when found) + cosine scores and fit bonus.
+*/
+if (last === "cap-compare" && request.method === "POST") {
+  try {
+    const body = await request.json().catch(() => ({}));
+    const myUEI = String(body?.my || "").trim().toUpperCase();
+    const incUEI = String(body?.inc || "").trim().toUpperCase();
+    const txDescs = Array.isArray(body?.txDescs) ? body.txDescs : [];
+
+    const stop = new Set(
+      "the,and,of,to,in,for,on,a,an,with,by,or,as,at,is,are,be,from,this,that,it,its,we,our,their,your,you,us,they,them,was,were,can,will,may,not,no,yes,via,into,over,under,per,performs,provide,provides"
+        .split(",")
+        .map((s) => s.trim())
+    );
+    const normalize = (s) =>
+      String(s || "")
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+    const tokens = (s) => normalize(s).split(" ").filter((w) => w && !stop.has(w) && w.length > 2);
+    const vec = (words) => {
+      const m = new Map();
+      for (const w of words) m.set(w, (m.get(w) || 0) + 1);
+      return m;
+    };
+    const cosine = (A, B) => {
+      const a = String(A || "").trim();
+      const b = String(B || "").trim();
+      if (!a || !b) return 0;
+      const va = vec(tokens(a));
+      const vb = vec(tokens(b));
+      let dot = 0,
+        na = 0,
+        nb = 0;
+      for (const [, v] of va) na += v * v;
+      for (const [, v] of vb) nb += v * v;
+      for (const [k, vaK] of va) dot += vaK * (vb.get(k) || 0);
+      const d = Math.sqrt(na) * Math.sqrt(nb);
+      return d ? dot / d : 0;
+    };
+    const bestCosineAgainstMany = (source, many) => {
+      if (!source || !many?.length) return 0;
+      let best = 0;
+      for (const s of many) best = Math.max(best, cosine(source, s));
+      return best;
+    };
+
+    const client = makeClient(env);
+    let mine = { uei: myUEI, name: null, narrative: "" };
+    let inc = { uei: incUEI || null, name: null, narrative: "" };
+
+    try {
+      await client.connect();
+      await client.query(`SET statement_timeout = '12s'`);
+
+      const sql = `
+        select uei, business_name as name, coalesce(nullif(capabilities_narrative,''), '') as narrative
+        from sba.smallbiz_v
+        where upper(uei) = upper($1)
+        limit 1`;
+
+      if (myUEI) {
+        const r1 = await client.query(sql, [myUEI]);
+        if (r1?.rows?.length) mine = { ...mine, ...r1.rows[0] };
+      }
+      if (incUEI) {
+        const r2 = await client.query(sql, [incUEI]);
+        if (r2?.rows?.length) inc = { ...inc, ...r2.rows[0] };
+      }
+    } finally {
+      try { await client.end(); } catch {}
+    }
+
+    // Compute scores (server-side, once)
+    const inc01 = cosine(mine.narrative, inc.narrative);                  // 0..1
+    const tx01  = bestCosineAgainstMany(mine.narrative, txDescs || []);   // 0..1
+    const inc5  = Math.round(inc01 * 5);
+    const tx5   = Math.round(tx01 * 5);
+    const bonus = Math.round(inc01 * 20) + Math.round(tx01 * 10);         // up to +30
+    const combined100 = Math.round((inc01 + tx01) * 50);
+
+    const res = {
+      ok: true,
+      mine,
+      incumbent: inc,
+      scores: {
+        inc01,
+        tx01,
+        inc5,
+        tx5,
+        combined100,
+        bonus,
+        uiNote:
+          mine.narrative || inc.narrative
+            ? `Capabilities match: combined ${combined100}/100 · vs incumbent ${inc5}/5 · vs transactions ${tx5}/5 (+${bonus})`
+            : "Capabilities match: no narratives found",
+        memoA:
+          mine.narrative && inc.narrative
+            ? `Capabilities comparison (your SBA narrative ↔ incumbent): ${inc5}/5.`
+            : "Capabilities comparison (your narrative vs incumbent): 0/5 (no narratives found).",
+        memoB:
+          mine.narrative
+            ? `Capabilities comparison (your SBA narrative ↔ transaction descriptions): ${tx5}/5.`
+            : "Capabilities comparison (your narrative vs transaction descriptions): 0/5 (no narrative to match).",
+      },
+    };
+
+    return new Response(JSON.stringify(res), {
+      status: 200,
+      headers: { ...headers, "Content-Type": "application/json" },
+    });
+  } catch (e) {
+    return new Response(
+      JSON.stringify({ ok: false, error: e?.message || "cap compare failed" }),
+      { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
+    );
+  }
+}
     /* -------------------- SBA capabilities (mine + incumbent) -------------------- */
     if (last === "sba-caps") {
       const uei = (url.searchParams.get("uei") || "").toUpperCase().trim();
