@@ -706,24 +706,48 @@ if (last === "my-entity") {
     let name = null, naics = [], website = null, caps = null, capsPdf = null, tags = [];
     try {
       const nameRes = await queryPreferringFast(client, mkName, [uei]);
-      name = (nameRes.rows[0] && nameRes.rows[0].recipient_name) || null;
+const naicsRes = await queryPreferringFast(client, mkNaics, [uei]);
+const name = (nameRes.rows[0] && nameRes.rows[0].recipient_name) || null;
+const naics = (naicsRes.rows || []).map((r) => r.naics_code).filter(Boolean);
 
-      const naicsRes = await queryPreferringFast(client, mkNaics, [uei]);
-      naics = (naicsRes.rows || []).map((r) => r.naics_code).filter(Boolean);
-    } catch {}
+// --- NEW: prefer Neon SBA view for socio-econ + website ---
+let smallBizCategories = [];
+let websiteFromSBA = null;
 
-    // SAM proxy (optional) for socio-ec tags
-    let samTags = [];
-    try {
-      if (env.SAM_PROXY_URL) {
-        const p = `${env.SAM_PROXY_URL.replace(/\/+$/, "")}/entity?uei=${encodeURIComponent(uei)}`;
-        const j = await fetchJSON(p);
-        const cats =
-          (Array.isArray(j && j.categories) && j.categories) ||
-          (j && j.entity && j.entity.socioEconomicCategories) || [];
-        samTags = normTags(cats);
-      }
-    } catch {}
+try {
+  const sba = await client.query(
+    `SELECT smallbiz_categories, naics_codes, website
+       FROM sba.smallbiz_v
+      WHERE upper(uei) = $1
+      LIMIT 1`,
+    [uei]
+  );
+  if (sba.rows.length) {
+    const r = sba.rows[0];
+    if (Array.isArray(r.smallbiz_categories)) {
+      smallBizCategories = r.smallbiz_categories.filter(Boolean);
+    } else if (r.smallbiz_categories) {
+      smallBizCategories = String(r.smallbiz_categories)
+        .split(/[;,|]/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+    }
+    if (r.website) websiteFromSBA = r.website;
+  }
+} catch { /* ok if SBA view missing */ }
+
+// Fallback: SAM proxy only if we still have nothing
+try {
+  if (!smallBizCategories.length && env.SAM_PROXY_URL) {
+    const p = `${env.SAM_PROXY_URL.replace(/\/+$/, "")}/entity?uei=${encodeURIComponent(uei)}`;
+    const j = await fetchJSON(p);
+    const cats =
+      (Array.isArray(j?.categories) && j.categories) ||
+      j?.entity?.socioEconomicCategories ||
+      [];
+    smallBizCategories = Array.from(new Set((cats || []).filter(Boolean)));
+  }
+} catch {}
 
     // Merge SBA first, fall back to legacy
     if (sba) {
@@ -747,27 +771,25 @@ if (last === "my-entity") {
     if (!tags.length) tags = samTags;
 
     return new Response(
-      JSON.stringify({
-        ok: true,
-        entity: {
-          uei,
-          name,
-          website,
-          capabilities: caps,
-          capabilities_pdf: capsPdf,
-          naics,
-          smallBizCategories: tags, // <<—— used by frontend
-        },
-      }),
-      {
-        status: 200,
-        headers: {
-          ...headers,
-          "Content-Type": "application/json",
-          "Cache-Control": "public, s-maxage=86400",
-        },
-      }
-    );
+  JSON.stringify({
+    ok: true,
+    entity: {
+      uei,
+      name,
+      naics,
+      smallBizCategories,
+      website: websiteFromSBA || null,
+    },
+  }),
+  {
+    status: 200,
+    headers: {
+      ...headers,
+      "Content-Type": "application/json",
+      "Cache-Control": "public, s-maxage=86400",
+    },
+  }
+);
   } catch (e) {
     return new Response(
       JSON.stringify({ ok: false, error: (e && e.message) || "query failed" }),
