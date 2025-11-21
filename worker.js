@@ -218,186 +218,54 @@ export default {
         try { await client.end(); } catch {}
       }
     }
-     /* -------------------- sba-caps (get capabilities narratives by UEI) -------------------- */
-// GET /sb/sba-caps?uei=<your UEI>&incumbentUei=<prime UEI>
-if (last === "sba-caps") {
-  const uei = (url.searchParams.get("uei") || "").trim().toUpperCase();
-  const incUei = (url.searchParams.get("incumbentUei") || "").trim().toUpperCase();
 
-  if (!uei) {
-    return new Response(JSON.stringify({ ok: false, error: "missing uei" }), {
-      status: 400,
-      headers: { ...headers, "Content-Type": "application/json" },
-    });
-  }
-
-  const client = makeClient(env);
-  try {
-    await client.connect();
-    await client.query(`SET statement_timeout = '15s'`);
-
-    // helper: fetch one row from the SBA view
-    const fetchOne = async (xUei) => {
-      if (!xUei) return null;
-      const q = `
-        SELECT
-          uei,
-          business_name,
-          NULLIF(TRIM(capabilities_narrative), '') AS capabilities_narrative
-        FROM sba.smallbiz_v
-        WHERE UPPER(uei) = $1
-        ORDER BY NULLIF(TRIM(last_updated_date), '') DESC NULLS LAST
-        LIMIT 1`;
-      const { rows } = await client.query(q, [xUei]);
-      return rows?.[0] || null;
-    };
-
-    const mine = await fetchOne(uei);
-    const incumbent = incUei ? await fetchOne(incUei) : null;
-
-    return new Response(JSON.stringify({ ok: true, mine, incumbent }), {
-      status: 200,
-      headers: { ...headers, "Content-Type": "application/json" },
-    });
-  } catch (e) {
-    return new Response(JSON.stringify({ ok: false, error: e?.message || "query failed" }), {
-      status: 500,
-      headers: { ...headers, "Content-Type": "application/json" },
-    });
-  } finally {
-    try { await client.end(); } catch {}
-  }
-}
-     /* -------------------- capabilities compare (server-side, stable) -------------------- */
-/*
-  POST /sb/cap-compare
-  Body: { my: "<UEI>", inc: "<UEI|null>", txDescs?: string[] }
-  Returns: SBA narratives for both UEIs (when found) + cosine scores and fit bonus.
-*/
-if (last === "cap-compare" && request.method === "POST") {
-  try {
-    const body = await request.json().catch(() => ({}));
-    const myUEI = String(body?.my || "").trim().toUpperCase();
-    const incUEI = String(body?.inc || "").trim().toUpperCase();
-    const txDescs = Array.isArray(body?.txDescs) ? body.txDescs : [];
-
-    const stop = new Set(
-      "the,and,of,to,in,for,on,a,an,with,by,or,as,at,is,are,be,from,this,that,it,its,we,our,their,your,you,us,they,them,was,were,can,will,may,not,no,yes,via,into,over,under,per,performs,provide,provides"
-        .split(",")
-        .map((s) => s.trim())
-    );
-    const normalize = (s) =>
-      String(s || "")
-        .toLowerCase()
-        .replace(/[^a-z0-9\s]/g, " ")
-        .replace(/\s+/g, " ")
-        .trim();
-    const tokens = (s) => normalize(s).split(" ").filter((w) => w && !stop.has(w) && w.length > 2);
-    const vec = (words) => {
-      const m = new Map();
-      for (const w of words) m.set(w, (m.get(w) || 0) + 1);
-      return m;
-    };
-    const cosine = (A, B) => {
-      const a = String(A || "").trim();
-      const b = String(B || "").trim();
-      if (!a || !b) return 0;
-      const va = vec(tokens(a));
-      const vb = vec(tokens(b));
-      let dot = 0,
-        na = 0,
-        nb = 0;
-      for (const [, v] of va) na += v * v;
-      for (const [, v] of vb) nb += v * v;
-      for (const [k, vaK] of va) dot += vaK * (vb.get(k) || 0);
-      const d = Math.sqrt(na) * Math.sqrt(nb);
-      return d ? dot / d : 0;
-    };
-    const bestCosineAgainstMany = (source, many) => {
-      if (!source || !many?.length) return 0;
-      let best = 0;
-      for (const s of many) best = Math.max(best, cosine(source, s));
-      return best;
-    };
-
-    const client = makeClient(env);
-    let mine = { uei: myUEI, name: null, narrative: "" };
-    let inc = { uei: incUEI || null, name: null, narrative: "" };
-
-    try {
-      await client.connect();
-      await client.query(`SET statement_timeout = '12s'`);
-
-      const sql = `
-        select uei, business_name as name, coalesce(nullif(capabilities_narrative,''), '') as narrative
-        from sba.smallbiz_v
-        where upper(uei) = upper($1)
-        limit 1`;
-
-      if (myUEI) {
-        const r1 = await client.query(sql, [myUEI]);
-        if (r1?.rows?.length) mine = { ...mine, ...r1.rows[0] };
+    /* -------------------- capabilities (SBA view) -------------------- */
+    // GET /sb/capabilities?my=<UEI>&inc=<UEI>
+    // Returns: { ok: true, data: { "<UEI>": "<capabilities_narrative>", ... } }
+    if (last === "capabilities") {
+      const my  = (url.searchParams.get("my")  || "").trim().toUpperCase();
+      const inc = (url.searchParams.get("inc") || "").trim().toUpperCase();
+      const ask = Array.from(new Set([my, inc].filter(Boolean)));
+      if (!ask.length) {
+        return new Response(JSON.stringify({ ok: false, error: "missing UEI" }), {
+          status: 400,
+          headers: { ...headers, "Content-Type": "application/json" },
+        });
       }
-      if (incUEI) {
-        const r2 = await client.query(sql, [incUEI]);
-        if (r2?.rows?.length) inc = { ...inc, ...r2.rows[0] };
+      const client = makeClient(env);
+      try {
+        await client.connect();
+        await client.query(`SET statement_timeout = '8s'`);
+        const { rows } = await client.query(
+          `SELECT UPPER(uei) AS uei, COALESCE(capabilities_narrative,'') AS cap
+             FROM sba.smallbiz_v
+            WHERE UPPER(uei) = ANY($1::text[])`,
+          [ask]
+        );
+        const data = {};
+        for (const r of rows) data[r.uei] = r.cap || "";
+        return new Response(JSON.stringify({ ok: true, data }), {
+          status: 200,
+          headers: { ...headers, "Content-Type": "application/json" },
+        });
+      } catch (e) {
+        return new Response(
+          JSON.stringify({ ok: false, error: e?.message || "capabilities query failed" }),
+          { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
+        );
+      } finally {
+        try { await client.end(); } catch {}
       }
-    } finally {
-      try { await client.end(); } catch {}
     }
 
-    // Compute scores (server-side, once)
-    const inc01 = cosine(mine.narrative, inc.narrative);                  // 0..1
-    const tx01  = bestCosineAgainstMany(mine.narrative, txDescs || []);   // 0..1
-    const inc5  = Math.round(inc01 * 5);
-    const tx5   = Math.round(tx01 * 5);
-    const bonus = Math.round(inc01 * 20) + Math.round(tx01 * 10);         // up to +30
-    const combined100 = Math.round((inc01 + tx01) * 50);
-
-    const res = {
-      ok: true,
-      mine,
-      incumbent: inc,
-      scores: {
-        inc01,
-        tx01,
-        inc5,
-        tx5,
-        combined100,
-        bonus,
-        uiNote:
-          mine.narrative || inc.narrative
-            ? `Capabilities match: combined ${combined100}/100 · vs incumbent ${inc5}/5 · vs transactions ${tx5}/5 (+${bonus})`
-            : "Capabilities match: no narratives found",
-        memoA:
-          mine.narrative && inc.narrative
-            ? `Capabilities comparison (your SBA narrative ↔ incumbent): ${inc5}/5.`
-            : "Capabilities comparison (your narrative vs incumbent): 0/5 (no narratives found).",
-        memoB:
-          mine.narrative
-            ? `Capabilities comparison (your SBA narrative ↔ transaction descriptions): ${tx5}/5.`
-            : "Capabilities comparison (your narrative vs transaction descriptions): 0/5 (no narrative to match).",
-      },
-    };
-
-    return new Response(JSON.stringify(res), {
-      status: 200,
-      headers: { ...headers, "Content-Type": "application/json" },
-    });
-  } catch (e) {
-    return new Response(
-      JSON.stringify({ ok: false, error: e?.message || "cap compare failed" }),
-      { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
-    );
-  }
-}
-    /* -------------------- SBA capabilities (mine + incumbent) -------------------- */
+     /* -------------------- sba-caps (get capabilities narratives by UEI) -------------------- */
+    // GET /sb/sba-caps?uei=<your UEI>&incumbentUei=<prime UEI>
     if (last === "sba-caps") {
-      const uei = (url.searchParams.get("uei") || "").toUpperCase().trim();
-      const incumbentUei = (url.searchParams.get("incumbentUei") || "").toUpperCase().trim();
+      const uei = (url.searchParams.get("uei") || "").trim().toUpperCase();
+      const incUei = (url.searchParams.get("incumbentUei") || "").trim().toUpperCase();
 
       if (!uei) {
-        return new Response(JSON.stringify({ ok: false, error: "uei required" }), {
+        return new Response(JSON.stringify({ ok: false, error: "missing uei" }), {
           status: 400,
           headers: { ...headers, "Content-Type": "application/json" },
         });
@@ -406,38 +274,165 @@ if (last === "cap-compare" && request.method === "POST") {
       const client = makeClient(env);
       try {
         await client.connect();
-        await client.query(`SET statement_timeout = '20s'`);
+        await client.query(`SET statement_timeout = '15s'`);
 
-        const sql = `
-          with q as (
-            select $1::text as me, nullif($2::text,'') as inc
-          )
-          select 'mine' as role, v.uei, v.business_name, v.capabilities_narrative
-          from sba.smallbiz_v v
-          join q on v.uei = q.me
-          union all
-          select 'incumbent' as role, v.uei, v.business_name, v.capabilities_narrative
-          from sba.smallbiz_v v
-          join q on q.inc is not null and v.uei = q.inc;
-        `;
+        // helper: fetch one row from the SBA view
+        const fetchOne = async (xUei) => {
+          if (!xUei) return null;
+          const q = `
+            SELECT
+              uei,
+              business_name,
+              NULLIF(TRIM(capabilities_narrative), '') AS capabilities_narrative
+            FROM sba.smallbiz_v
+            WHERE UPPER(uei) = $1
+            ORDER BY NULLIF(TRIM(last_updated_date), '') DESC NULLS LAST
+            LIMIT 1`;
+          const { rows } = await client.query(q, [xUei]);
+          return rows?.[0] || null;
+        };
 
-        const { rows } = await client.query(sql, [uei, incumbentUei]);
-        const mine = rows.find(r => r.role === "mine") || null;
-        const incumbent = rows.find(r => r.role === "incumbent") || null;
+        const mine = await fetchOne(uei);
+        const incumbent = incUei ? await fetchOne(incUei) : null;
 
         return new Response(JSON.stringify({ ok: true, mine, incumbent }), {
           status: 200,
           headers: { ...headers, "Content-Type": "application/json" },
         });
       } catch (e) {
-        return new Response(
-          JSON.stringify({ ok: false, error: (e && e.message) || "query failed" }),
-          { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
-        );
+        return new Response(JSON.stringify({ ok: false, error: e?.message || "query failed" }), {
+          status: 500,
+          headers: { ...headers, "Content-Type": "application/json" },
+        });
       } finally {
         try { await client.end(); } catch {}
       }
     }
+
+     /* -------------------- capabilities compare (server-side, stable) -------------------- */
+    /*
+      POST /sb/cap-compare
+      Body: { my: "<UEI>", inc: "<UEI|null>", txDescs?: string[] }
+      Returns: SBA narratives for both UEIs (when found) + cosine scores and fit bonus.
+    */
+    if (last === "cap-compare" && request.method === "POST") {
+      try {
+        const body = await request.json().catch(() => ({}));
+        const myUEI = String(body?.my || "").trim().toUpperCase();
+        const incUEI = String(body?.inc || "").trim().toUpperCase();
+        const txDescs = Array.isArray(body?.txDescs) ? body.txDescs : [];
+
+        const stop = new Set(
+          "the,and,of,to,in,for,on,a,an,with,by,or,as,at,is,are,be,from,this,that,it,its,we,our,their,your,you,us,they,them,was,were,can,will,may,not,no,yes,via,into,over,under,per,performs,provide,provides"
+            .split(",")
+            .map((s) => s.trim())
+        );
+        const normalize = (s) =>
+          String(s || "")
+            .toLowerCase()
+            .replace(/[^a-z0-9\s]/g, " ")
+            .replace(/\s+/g, " ")
+            .trim();
+        const tokens = (s) => normalize(s).split(" ").filter((w) => w && !stop.has(w) && w.length > 2);
+        const vec = (words) => {
+          const m = new Map();
+          for (const w of words) m.set(w, (m.get(w) || 0) + 1);
+          return m;
+        };
+        const cosine = (A, B) => {
+          const a = String(A || "").trim();
+          const b = String(B || "").trim();
+          if (!a || !b) return 0;
+          const va = vec(tokens(a));
+          const vb = vec(tokens(b));
+          let dot = 0,
+            na = 0,
+            nb = 0;
+          for (const [, v] of va) na += v * v;
+          for (const [, v] of vb) nb += v * v;
+          for (const [k, vaK] of va) dot += vaK * (vb.get(k) || 0);
+          const d = Math.sqrt(na) * Math.sqrt(nb);
+          return d ? dot / d : 0;
+        };
+        const bestCosineAgainstMany = (source, many) => {
+          if (!source || !many?.length) return 0;
+          let best = 0;
+          for (const s of many) best = Math.max(best, cosine(source, s));
+          return best;
+        };
+
+        const client = makeClient(env);
+        let mine = { uei: myUEI, name: null, narrative: "" };
+        let inc = { uei: incUEI || null, name: null, narrative: "" };
+
+        try {
+          await client.connect();
+          await client.query(`SET statement_timeout = '12s'`);
+
+          const sql = `
+            select uei, business_name as name, coalesce(nullif(capabilities_narrative,''), '') as narrative
+            from sba.smallbiz_v
+            where upper(uei) = upper($1)
+            limit 1`;
+
+          if (myUEI) {
+            const r1 = await client.query(sql, [myUEI]);
+            if (r1?.rows?.length) mine = { ...mine, ...r1.rows[0] };
+          }
+          if (incUEI) {
+            const r2 = await client.query(sql, [incUEI]);
+            if (r2?.rows?.length) inc = { ...inc, ...r2.rows[0] };
+          }
+        } finally {
+          try { await client.end(); } catch {}
+        }
+
+        // Compute scores (server-side, once)
+        const inc01 = cosine(mine.narrative, inc.narrative);                  // 0..1
+        const tx01  = bestCosineAgainstMany(mine.narrative, txDescs || []);   // 0..1
+        const inc5  = Math.round(inc01 * 5);
+        const tx5   = Math.round(tx01 * 5);
+        const bonus = Math.round(inc01 * 20) + Math.round(tx01 * 10);         // up to +30
+        const combined100 = Math.round((inc01 + tx01) * 50);
+
+        const res = {
+          ok: true,
+          mine,
+          incumbent: inc,
+          scores: {
+            inc01,
+            tx01,
+            inc5,
+            tx5,
+            combined100,
+            bonus,
+            uiNote:
+              mine.narrative || inc.narrative
+                ? `Capabilities match: combined ${combined100}/100 · vs incumbent ${inc5}/5 · vs transactions ${tx5}/5 (+${bonus})`
+                : "Capabilities match: no narratives found",
+            memoA:
+              mine.narrative && inc.narrative
+                ? `Capabilities comparison (your SBA narrative ↔ incumbent): ${inc5}/5.`
+                : "Capabilities comparison (your narrative vs incumbent): 0/5 (no narratives found).",
+            memoB:
+              mine.narrative
+                ? `Capabilities comparison (your SBA narrative ↔ transaction descriptions): ${tx5}/5.`
+                : "Capabilities comparison (your narrative vs transaction descriptions): 0/5 (no narrative to match).",
+          },
+        };
+
+        return new Response(JSON.stringify(res), {
+          status: 200,
+          headers: { ...headers, "Content-Type": "application/json" },
+        });
+      } catch (e) {
+        return new Response(
+          JSON.stringify({ ok: false, error: e?.message || "cap compare failed" }),
+          { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
+        );
+      }
+    }
+
     /* -------------------- expiring-contracts (cached 5m) -------------------- */
     if (last === "expiring-contracts") {
       const naicsParam = (url.searchParams.get("naics") || "").trim();
