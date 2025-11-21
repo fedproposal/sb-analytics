@@ -249,60 +249,46 @@ export default {
         await client.connect();
         await client.query(`SET statement_timeout = '20s'`);
        const mkSQL = (table) => `
-  WITH base AS (
-    SELECT
-      award_id_piid                         AS piid,
-      award_key                             AS award_key,
-      awarding_agency_name                  AS agency,
-      naics_code                            AS naics,
-      /* NEW: incumbent name */
-    COALESCE(NULLIF(recipient_name,''), NULL) AS incumbent,
-      pop_current_end_date                  AS end_date,
-      potential_total_value_of_award_num    AS value,
-      recipient_name,
-      recipient_uei
-    FROM ${table}
-    WHERE pop_current_end_date >= CURRENT_DATE
-      AND pop_current_end_date < CURRENT_DATE + $1::int
-      AND (
-        $2::text IS NULL
-        OR awarding_agency_name     = $2
-        OR awarding_sub_agency_name = $2
-        OR awarding_office_name     = $2
-      )
-      AND (
-        $3::text[] IS NULL
-        OR naics_code = ANY($3)
-      )
-  )
   SELECT
-    b.piid,
-    b.award_key,
-    b.agency,
-    b.naics,
-    b.end_date,
-    b.value,
-    /* incumbent name + UEI with backfill from any non-null row for same PIID */
+    award_id_piid           AS piid,
+    award_key               AS award_key,
+    awarding_agency_name    AS agency,
+    naics_code              AS naics,
+    pop_current_end_date    AS end_date,
+    potential_total_value_of_award_num AS value,
+
+    /* NEW: incumbent company with resilient fallbacks */
     COALESCE(
-      b.recipient_name,
-      (SELECT b2.recipient_name
-         FROM ${table} b2
-        WHERE b2.award_id_piid = b.piid
-          AND b2.recipient_name IS NOT NULL
-        ORDER BY COALESCE(b2.action_date, b2.pop_current_end_date) DESC NULLS LAST
-        LIMIT 1)
-    ) AS incumbent,
-    COALESCE(
-      b.recipient_uei,
-      (SELECT b2.recipient_uei
-         FROM ${table} b2
-        WHERE b2.award_id_piid = b.piid
-          AND b2.recipient_uei IS NOT NULL
-        ORDER BY COALESCE(b2.action_date, b2.pop_current_end_date) DESC NULLS LAST
-        LIMIT 1)
-    ) AS incumbent_uei
-  FROM base b
-  ORDER BY b.end_date ASC
+      NULLIF(TRIM(recipient_name), ''),
+
+      /* if this row is a mod without a name, grab any recent name for same PIID */
+      (
+        SELECT NULLIF(TRIM(t2.recipient_name), '')
+        FROM ${table} t2
+        WHERE t2.award_id_piid = ${table}.award_id_piid
+          AND t2.recipient_name IS NOT NULL
+          AND TRIM(t2.recipient_name) <> ''
+        ORDER BY t2.fiscal_year DESC NULLS LAST, t2.pop_current_end_date DESC NULLS LAST
+        LIMIT 1
+      ),
+
+      /* absolute last resort, show UEI so the cell is never blank */
+      NULLIF(TRIM(recipient_uei), '')
+    ) AS incumbent_company
+  FROM ${table}
+  WHERE pop_current_end_date >= CURRENT_DATE
+    AND pop_current_end_date < CURRENT_DATE + $1::int
+    AND (
+      $2::text IS NULL
+      OR awarding_agency_name      = $2
+      OR awarding_sub_agency_name  = $2
+      OR awarding_office_name      = $2
+    )
+    AND (
+      $3::text[] IS NULL
+      OR naics_code = ANY($3)
+    )
+  ORDER BY pop_current_end_date ASC
   LIMIT $4`;
         const params = [windowDays, agencyFilter || null, naicsList.length ? naicsList : null, limit];
         const { rows } = await queryPreferringFast(client, mkSQL, params);
