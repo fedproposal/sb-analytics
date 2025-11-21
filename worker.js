@@ -780,8 +780,17 @@ recipient_uei  AS incumbent_uei
         return new Response(
           JSON.stringify({
             ok: true,
-            entity: { uei, name, naics, smallBizCategories, website: website || null },
-          }),
+            entity: {
+  uei,
+  name,
+  naics,
+  smallBizCategories,
+  // prefer SBA website but fall back to any legacy/scraped value
+  website: websiteFromSBA || website || null,
+  // NEW: expose capabilities so the UI can consume them
+  capabilitiesNarrative: caps || null,
+  capabilitiesStatementLink: capsPdf || null,
+},
           {
             status: 200,
             headers: {
