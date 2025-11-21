@@ -218,7 +218,53 @@ export default {
         try { await client.end(); } catch {}
       }
     }
+    /* -------------------- SBA capabilities (mine + incumbent) -------------------- */
+    if (last === "sba-caps") {
+      const uei = (url.searchParams.get("uei") || "").toUpperCase().trim();
+      const incumbentUei = (url.searchParams.get("incumbentUei") || "").toUpperCase().trim();
 
+      if (!uei) {
+        return new Response(JSON.stringify({ ok: false, error: "uei required" }), {
+          status: 400,
+          headers: { ...headers, "Content-Type": "application/json" },
+        });
+      }
+
+      const client = makeClient(env);
+      try {
+        await client.connect();
+        await client.query(`SET statement_timeout = '20s'`);
+
+        const sql = `
+          with q as (
+            select $1::text as me, nullif($2::text,'') as inc
+          )
+          select 'mine' as role, v.uei, v.business_name, v.capabilities_narrative
+          from sba.smallbiz_v v
+          join q on v.uei = q.me
+          union all
+          select 'incumbent' as role, v.uei, v.business_name, v.capabilities_narrative
+          from sba.smallbiz_v v
+          join q on q.inc is not null and v.uei = q.inc;
+        `;
+
+        const { rows } = await client.query(sql, [uei, incumbentUei]);
+        const mine = rows.find(r => r.role === "mine") || null;
+        const incumbent = rows.find(r => r.role === "incumbent") || null;
+
+        return new Response(JSON.stringify({ ok: true, mine, incumbent }), {
+          status: 200,
+          headers: { ...headers, "Content-Type": "application/json" },
+        });
+      } catch (e) {
+        return new Response(
+          JSON.stringify({ ok: false, error: (e && e.message) || "query failed" }),
+          { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
+        );
+      } finally {
+        try { await client.end(); } catch {}
+      }
+    }
     /* -------------------- expiring-contracts (cached 5m) -------------------- */
     if (last === "expiring-contracts") {
       const naicsParam = (url.searchParams.get("naics") || "").trim();
