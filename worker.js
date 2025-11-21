@@ -652,62 +652,131 @@ export default {
       });
     }
 
-    /* -------------------- my-entity -------------------- */
-    if (last === "my-entity") {
-      const uei = (url.searchParams.get("uei") || "").trim().toUpperCase();
-      if (!uei) {
-        return new Response(JSON.stringify({ ok: false, error: "Missing uei parameter." }), {
-          status: 400, headers: { ...headers, "Content-Type": "application/json" },
-        });
-      }
+    /* -------------------- my-entity (now uses SBA view first) -------------------- */
+if (last === "my-entity") {
+  const uei = (url.searchParams.get("uei") || "").trim().toUpperCase();
+  if (!uei) {
+    return new Response(JSON.stringify({ ok: false, error: "Missing uei parameter." }), {
+      status: 400, headers: { ...headers, "Content-Type": "application/json" },
+    });
+  }
 
-      const client = makeClient(env);
-      try {
-        await client.connect();
-        await client.query(`SET statement_timeout = '20s'`);
-
-        const mkName = (t) => `SELECT recipient_name FROM ${t} WHERE recipient_uei = $1
-          ORDER BY total_dollars_obligated_num DESC NULLS LAST LIMIT 1`;
-        const mkNaics = (t) => `SELECT DISTINCT naics_code FROM ${t} WHERE recipient_uei = $1 AND naics_code IS NOT NULL LIMIT 200`;
-
-        const nameRes = await queryPreferringFast(client, mkName, [uei]);
-        const naicsRes = await queryPreferringFast(client, mkNaics, [uei]);
-        const name = (nameRes.rows[0] && nameRes.rows[0].recipient_name) || null;
-        const naics = (naicsRes.rows || []).map((r) => r.naics_code).filter(Boolean);
-
-        // optional SAM proxy for socio-econ
-        let smallBizCategories = [];
-        try {
-          if (env.SAM_PROXY_URL) {
-            const p = `${env.SAM_PROXY_URL.replace(/\/+$/, "")}/entity?uei=${encodeURIComponent(uei)}`;
-            const j = await fetchJSON(p);
-            const cats =
-              (Array.isArray(j && j.categories) && j.categories) ||
-              (j && j.entity && j.entity.socioEconomicCategories) || [];
-            smallBizCategories = Array.from(new Set((cats || []).filter(Boolean)));
-          }
-        } catch {}
-
-        return new Response(
-          JSON.stringify({ ok: true, entity: { uei, name, naics, smallBizCategories } }),
-          {
-            status: 200,
-            headers: {
-              ...headers,
-              "Content-Type": "application/json",
-              "Cache-Control": "public, s-maxage=86400",
-            },
-          }
-        );
-      } catch (e) {
-        return new Response(
-          JSON.stringify({ ok: false, error: (e && e.message) || "query failed" }),
-          { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
-        );
-      } finally {
-        try { await client.end(); } catch {}
-      }
+  // normalize/merge SBA tags into a consistent set
+  const normTags = (list) => {
+    const out = new Set();
+    for (const raw of list || []) {
+      const s = String(raw || "").toUpperCase();
+      if (!s) continue;
+      if (/\b8\s*\(?A\)?/.test(s) || s.includes("8(A)")) out.add("8(A)");
+      if (s.includes("SDVOSB") || s.includes("SERVICE-DISABLED")) out.add("SDVOSB");
+      if (s.includes("WOSB") || s.includes("WOMEN")) out.add("WOSB");
+      if (s.includes("HUBZONE")) out.add("HUBZONE");
+      if (s.includes("VOSB") && !s.includes("SDVOSB")) out.add("VOSB");
+      if (s.includes("SMALL BUSINESS")) out.add("SMALL BUSINESS");
     }
+    return Array.from(out);
+  };
+
+  const client = makeClient(env);
+  try {
+    await client.connect();
+    await client.query(`SET statement_timeout = '20s'`);
+
+    // 1) Prefer your SBA view (fast, rich)
+    let sba = null;
+    try {
+      const q = await client.query(
+        `SELECT uei, business_name, website,
+                capabilities_narrative, capabilities_statement_link,
+                smallbiz_categories, naics_codes, active_sba_certifications_raw
+           FROM sba.smallbiz_v
+          WHERE UPPER(uei) = UPPER($1)
+          LIMIT 1`,
+        [uei]
+      );
+      sba = q.rows[0] || null;
+    } catch { /* schema/table may not exist; fall through */ }
+
+    // 2) Always keep legacy fallbacks from awards & SAM proxy
+    //    (used if SBA row missing any fields)
+    const mkName = (t) => `SELECT recipient_name FROM ${t} WHERE recipient_uei = $1
+      ORDER BY total_dollars_obligated_num DESC NULLS LAST LIMIT 1`;
+    const mkNaics = (t) => `SELECT DISTINCT naics_code FROM ${t} WHERE recipient_uei = $1 AND naics_code IS NOT NULL LIMIT 200`;
+
+    let name = null, naics = [], website = null, caps = null, capsPdf = null, tags = [];
+    try {
+      const nameRes = await queryPreferringFast(client, mkName, [uei]);
+      name = (nameRes.rows[0] && nameRes.rows[0].recipient_name) || null;
+
+      const naicsRes = await queryPreferringFast(client, mkNaics, [uei]);
+      naics = (naicsRes.rows || []).map((r) => r.naics_code).filter(Boolean);
+    } catch {}
+
+    // SAM proxy (optional) for socio-ec tags
+    let samTags = [];
+    try {
+      if (env.SAM_PROXY_URL) {
+        const p = `${env.SAM_PROXY_URL.replace(/\/+$/, "")}/entity?uei=${encodeURIComponent(uei)}`;
+        const j = await fetchJSON(p);
+        const cats =
+          (Array.isArray(j && j.categories) && j.categories) ||
+          (j && j.entity && j.entity.socioEconomicCategories) || [];
+        samTags = normTags(cats);
+      }
+    } catch {}
+
+    // Merge SBA first, fall back to legacy
+    if (sba) {
+      name     = sba.business_name || name;
+      website  = (sba.website || website || null);
+      caps     = sba.capabilities_narrative || null;
+      capsPdf  = sba.capabilities_statement_link || null;
+      // prefer parsed arrays from view; otherwise try to parse raw strings
+      if (Array.isArray(sba.naics_codes) && sba.naics_codes.length) {
+        naics = sba.naics_codes.filter(Boolean);
+      } else if (sba.all_naics_codes) {
+        naics = String(sba.all_naics_codes).split(/[,\s]+/).map((x)=>x.trim()).filter(Boolean);
+      }
+      const sbaCats = Array.isArray(sba.smallbiz_categories)
+        ? sba.smallbiz_categories
+        : String(sba.active_sba_certifications_raw || "").split(/[;,]/).map((x)=>x.trim()).filter(Boolean);
+      tags = normTags(sbaCats);
+    }
+
+    // If still empty, fall back to SAM tags
+    if (!tags.length) tags = samTags;
+
+    return new Response(
+      JSON.stringify({
+        ok: true,
+        entity: {
+          uei,
+          name,
+          website,
+          capabilities: caps,
+          capabilities_pdf: capsPdf,
+          naics,
+          smallBizCategories: tags, // <<—— used by frontend
+        },
+      }),
+      {
+        status: 200,
+        headers: {
+          ...headers,
+          "Content-Type": "application/json",
+          "Cache-Control": "public, s-maxage=86400",
+        },
+      }
+    );
+  } catch (e) {
+    return new Response(
+      JSON.stringify({ ok: false, error: (e && e.message) || "query failed" }),
+      { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
+    );
+  } finally {
+    try { await client.end(); } catch {}
+  }
+}
 
     /* -------------------- bid-nobid (numeric scorer) -------------------- */
     if (last === "bid-nobid") {
