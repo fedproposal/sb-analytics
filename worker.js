@@ -253,6 +253,8 @@ export default {
             award_id_piid           AS piid,
             award_key               AS award_key,
             awarding_agency_name    AS agency,
+            recipient_name          AS incumbent,        -- NEW
++            recipient_uei           AS incumbent_uei,    -- NEW (optional)
             naics_code              AS naics,
             pop_current_end_date    AS end_date,
             potential_total_value_of_award_num AS value
