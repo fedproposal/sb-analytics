@@ -254,6 +254,8 @@ export default {
     award_key               AS award_key,
     awarding_agency_name    AS agency,
     naics_code              AS naics,
+    recipient_name AS incumbent,
+recipient_uei  AS incumbent_uei
     pop_current_end_date    AS end_date,
     potential_total_value_of_award_num AS value,
 
