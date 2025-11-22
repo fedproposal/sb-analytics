@@ -1,4 +1,4 @@
-// worker.js — sb-analytics (DB-first; resilient; includes /fit/capability with explainable, domain-agnostic matching)
+// worker.js — sb-analytics (DB-first; resilient; includes /cap-compare with continuous weighting and /fit/capability fix)
 
 import { Client } from "pg";
 
@@ -297,203 +297,130 @@ export default {
       }
     }
 
-    /* -------------------- capabilities compare (server-side, stable & explainable) -------------------- */
+    /* -------------------- capabilities compare (continuous weighting; explainable) -------------------- */
     /*
       POST /sb/cap-compare
       Body: { my: "<UEI>", inc: "<UEI|null>", txDescs?: string[] }
-      Returns: SBA narratives for both UEIs (when found) + 5/5 hit tests, bonus, and an explanation block with matched terms.
+      Returns: SBA narratives for both UEIs (when found) + 0–5 subscores, 0–30 bonus (weighted, TX-heavy), combined100, and explain.
     */
-// PATCH: Drop-in replacement for the /sb/cap-compare handler inside your Worker
-// Purpose: Make response shape match OpportunityFit.tsx expectations
-// Change: memoA and memoB are now nested INSIDE `scores` (so TSX can read s.memoA / s.memoB)
+    if (last === "cap-compare" && request.method === "POST") {
+      try {
+        const body = await request.json().catch(() => ({}));
+        const myUEI = String(body?.my || "").trim().toUpperCase();
+        const incUEI = String(body?.inc || "").trim().toUpperCase();
+        const txDescs = Array.isArray(body?.txDescs) ? body.txDescs : [];
 
-if (last === "cap-compare" && request.method === "POST") {
-  try {
-    const body = await request.json().catch(() => ({}));
-    const myUEI = String(body?.my || "").trim().toUpperCase();
-    const incUEI = String(body?.inc || "").trim().toUpperCase();
-    const txDescs = Array.isArray(body?.txDescs) ? body.txDescs : [];
+        const client = makeClient(env);
+        let mine = { uei: myUEI, name: null, narrative: "" };
+        let inc  = { uei: incUEI || null, name: null, narrative: "" };
 
-    const client = makeClient(env);
-    let mine = { uei: myUEI, name: null, narrative: "" };
-    let inc  = { uei: incUEI || null, name: null, narrative: "" };
+        try {
+          await client.connect();
+          await client.query(`SET statement_timeout = '12s'`);
 
-    try {
-      await client.connect();
-      await client.query(`SET statement_timeout = '12s'`);
+          const sql = `
+            select uei, business_name as name, coalesce(nullif(capabilities_narrative,''), '') as narrative
+            from sba.smallbiz_v
+            where upper(uei) = upper($1)
+            limit 1`;
 
-      const sql = `
-        select uei, business_name as name, coalesce(nullif(capabilities_narrative,''), '') as narrative
-        from sba.smallbiz_v
-        where upper(uei) = upper($1)
-        limit 1`;
+          if (myUEI) {
+            const r1 = await client.query(sql, [myUEI]);
+            if (r1?.rows?.length) mine = { ...mine, ...r1.rows[0] };
+          }
+          if (incUEI) {
+            const r2 = await client.query(sql, [incUEI]);
+            if (r2?.rows?.length) inc = { ...inc, ...r2.rows[0] };
+          }
+        } finally {
+          try { await client.end(); } catch {}
+        }
 
-      if (myUEI) {
-        const r1 = await client.query(sql, [myUEI]);
-        if (r1?.rows?.length) mine = { ...mine, ...r1.rows[0] };
-      }
-      if (incUEI) {
-        const r2 = await client.query(sql, [incUEI]);
-        if (r2?.rows?.length) inc = { ...inc, ...r2.rows[0] };
-      }
-    } finally {
-      try { await client.end(); } catch {}
-    }
+        // Build signals
+        const myText = mine.narrative || "";
+        const incText = inc.narrative || "";
+        const txBlob = (txDescs || []).join(" ");
 
-    // Anchor terms from your SBA narrative
-    const anchors = topTermsFrom(mine.narrative || "", 25).map(x => x.term);
-    const incNorm = normalize(inc.narrative || "");
-    const txBlob  = (txDescs || []).join(" ");
-    const txNorm  = normalize(txBlob);
+        // Sparse-safe cosine
+        const mineBag = bag(tokenize(myText));
+        const incBag  = bag(tokenize(incText));
+        const txBag   = bag(tokenize(txBlob));
 
-    // Count helper
-    const countMatches = (normText, terms) => {
-      const out = [];
-      if (!normText) return out;
-      for (const t of terms) {
-        if (!t) continue;
-        const re = new RegExp(`\\b${t}\\b`, "g");
-        const m = normText.match(re);
-        if (m && m.length) out.push({ term: t, count: m.length });
-      }
-      return out.sort((a,b) => b.count - a.count).slice(0, 12);
-    };
+        let inc01 = (myText && incText) ? cosineFromBags(mineBag, incBag) : 0;
+        const tx01  = (myText && txBlob) ? cosineFromBags(mineBag, txBag) : 0;
 
-    const incMatches = countMatches(incNorm, anchors);
-    const txMatches  = countMatches(txNorm, anchors);
+        // If same entity (you are the incumbent), force perfect incumbent overlap
+        if (incUEI && myUEI && incUEI.toUpperCase() === myUEI.toUpperCase() && myText) inc01 = 1;
 
-    // All-or-nothing 5/5 scoring
-    const inc5 = incMatches.length > 0 ? 5 : 0;
-    const tx5  = txMatches.length  > 0 ? 5 : 0;
+        // Weighted bonus (TX heavier than INC) -> 0..30
+        const W_TX  = 18;
+        const W_INC = 12;
+        const bonus = Math.round(tx01 * W_TX + inc01 * W_INC);
 
-    // Bonus & combined (keep your scale)
-    const bonus = (inc5 ? 20 : 0) + (tx5 ? 10 : 0);       // up to +30
-    const combined100 = (inc5 ? 50 : 0) + (tx5 ? 50 : 0); // 0..100
+        // Normalized 0..5 subscores + combined 0..100
+        const inc5 = Math.round(inc01 * 5);
+        const tx5  = Math.round(tx01 * 5);
+        const combined100 = Math.round((inc01 + tx01) * 50);
 
-    const uiNote =
-      `Capabilities match: combined ${combined100}/100 · ` +
-      `vs incumbent ${inc5}/5 · vs transactions ${tx5}/5 ` +
-      `(+${bonus})`;
+        // Matched terms (anchors from your narrative against others)
+        const anchors = topTermsFrom(myText, 25).map(x => x.term);
+        const normInc = normalize(incText);
+        const normTx  = normalize(txBlob);
 
-    // ✔ CHANGE HERE: memoA/memoB moved inside scores
-    const scores = {
-      inc5,
-      tx5,
-      bonus,
-      combined100,
-      uiNote,
-      memoA: inc5 === 5
-        ? "Capabilities comparison (your SBA narrative ↔ incumbent): 5/5."
-        : "Capabilities comparison (your SBA narrative ↔ incumbent): 0/5.",
-      memoB: tx5 === 5
-        ? "Capabilities comparison (your SBA narrative ↔ transaction descriptions): 5/5."
-        : "Capabilities comparison (your SBA narrative ↔ transaction descriptions): 0/5.",
-    };
+        const countMatches = (normText, terms) => {
+          const out = [];
+          if (!normText) return out;
+          for (const t of terms) {
+            if (!t) continue;
+            const re = new RegExp(`\\b${t}\\b`, "g");
+            const m = normText.match(re);
+            if (m && m.length) out.push({ term: t, count: m.length });
+          }
+          return out.sort((a,b) => b.count - a.count).slice(0, 12);
+        };
 
-    const res = {
-      ok: true,
-      mine,
-      incumbent: inc,
-      scores,
-      explain: {
-        anchors,
-        incMatches,
-        txMatches,
-        notes: [
-          "All-or-nothing checks: if any of your anchor terms appear, score is 5/5.",
-          "incMatches and txMatches list the specific matched terms with counts.",
-        ],
-      },
-    };
+        const incMatches = countMatches(normInc, anchors);
+        const txMatches  = countMatches(normTx,  anchors);
 
-    return new Response(JSON.stringify(res), {
-      status: 200,
-      headers: { ...headers, "Content-Type": "application/json" },
-    });
-  } catch (e) {
-    return new Response(
-      JSON.stringify({ ok: false, error: e?.message || "cap compare failed" }),
-      { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
-    );
-  }
-}
+        const uiNote =
+          `Capabilities match: combined ${combined100}/100 · ` +
+          `vs incumbent ${inc5}/5 · vs transactions ${tx5}/5 ` +
+          `(+${bonus})`;
 
+        const res = {
+          ok: true,
+          mine,
+          incumbent: inc,
+          scores: {
+            inc5, tx5, bonus, combined100, uiNote,
+            memoA: inc5 >= 4
+              ? "Capabilities comparison (your SBA narrative ↔ incumbent): strong."
+              : inc5 >= 2
+              ? "Capabilities comparison (your SBA narrative ↔ incumbent): moderate."
+              : "Capabilities comparison (your SBA narrative ↔ incumbent): weak.",
+            memoB: tx5 >= 4
+              ? "Capabilities comparison (your SBA narrative ↔ transaction descriptions): strong."
+              : tx5 >= 2
+              ? "Capabilities comparison (your SBA narrative ↔ transaction descriptions): moderate."
+              : "Capabilities comparison (your SBA narrative ↔ transaction descriptions): weak.",
+          },
+          explain: {
+            anchors,
+            incMatches,
+            txMatches,
+            weights: { W_TX, W_INC },
+          },
+        };
 
         return new Response(JSON.stringify(res), {
           status: 200,
           headers: { ...headers, "Content-Type": "application/json" },
         });
-      } 
-   catch (e) {
+      } catch (e) {
         return new Response(
           JSON.stringify({ ok: false, error: e?.message || "cap compare failed" }),
           { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
         );
-      }
-    }
-
-    /* -------------------- expiring-contracts (cached 5m) -------------------- */
-    // ... (unchanged code below)
-    // NOTE: everything after this comment is identical to your current worker.
-    // I am leaving it intact to keep the edit surgical. 
-    // [The remainder of the worker stays exactly as in your last version.]
-    
-    // --- SNIP: The rest of your existing endpoints are unchanged ---
-    // To keep this message concise, I'm not repeating the entire tail of the file.
-    // Paste this updated /cap-compare block into your current worker.js.
-
-    return new Response("Not found", { status: 404, headers });
-  },
-};
-
-      const client = makeClient(env);
-      try {
-        await client.connect();
-        await client.query(`SET statement_timeout = '20s'`);
-        const mkSQL = (table) => `
-          SELECT
-            award_id_piid           AS piid,
-            award_key               AS award_key,
-            awarding_agency_name    AS agency,
-            recipient_name          AS incumbent,
-            naics_code              AS naics,
-            pop_current_end_date    AS end_date,
-            potential_total_value_of_award_num AS value
-          FROM ${table}
-          WHERE pop_current_end_date >= CURRENT_DATE
-            AND pop_current_end_date < CURRENT_DATE + $1::int
-            AND (
-              $2::text IS NULL
-              OR awarding_agency_name      = $2
-              OR awarding_sub_agency_name  = $2
-              OR awarding_office_name      = $2
-            )
-            AND (
-              $3::text[] IS NULL
-              OR naics_code = ANY($3)
-            )
-          ORDER BY pop_current_end_date ASC
-          LIMIT $4`;
-        const params = [windowDays, agencyFilter || null, naicsList.length ? naicsList : null, limit];
-        const { rows } = await queryPreferringFast(client, mkSQL, params);
-
-        const res = new Response(JSON.stringify({ ok: true, rows }), {
-          status: 200,
-          headers: {
-            ...headers,
-            "Content-Type": "application/json",
-            "Cache-Control": "public, s-maxage=300, stale-while-revalidate=86400",
-          },
-        });
-        ctx.waitUntil(cache.put(cacheKey, res.clone()));
-        return res;
-      } catch (e) {
-        return new Response(
-          JSON.stringify({ ok: false, error: (e && e.message) || "query failed" }),
-          { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
-        );
-      } finally {
-        try { await client.end(); } catch {}
       }
     }
 
@@ -1016,9 +943,9 @@ if (last === "cap-compare" && request.method === "POST") {
         });
       }
 
-      // Optional tunable weights (default 18 + 12 = 30 total)
-      const W_INC = Math.max(0, Math.min(30, Number(body?.weights?.inc_vs_my ?? 18)));
-      const W_TX  = Math.max(0, Math.min(30 - W_INC, Number(body?.weights?.my_vs_tx ?? 12)));
+      // Optional tunable weights (default TX-heavy)
+      const W_INC = Math.max(0, Math.min(30, Number(body?.weights?.inc_vs_my ?? 12)));
+      const W_TX  = Math.max(0, Math.min(30 - W_INC, Number(body?.weights?.my_vs_tx ?? 18)));
       const P_MAX = 30;
 
       const client = makeClient(env);
@@ -1071,18 +998,18 @@ if (last === "cap-compare" && request.method === "POST") {
         );
         const txnBlob = (tx.rows || []).map((r) => String(r.transaction_description || "")).join(" ");
 
-        // Unified cosine scoring (aligns with /sb/cap-compare)
-const mineBag = bag(tokenize(mine.narrative || ""))
-const incBag  = bag(tokenize(inc.narrative || ""))
-const txBag   = bag(tokenize(txBlob || ""))
+        // Cosine signals
+        const mineBag = bag(tokenize(myCaps || ""));
+        const incBag  = bag(tokenize(incCaps || ""));
+        const txBag   = bag(tokenize(txnBlob || ""));
 
         let inc01 = (myCaps && incCaps) ? cosineFromBags(mineBag, incBag) : 0;
         if (incUEI && uei && incUEI.toUpperCase() === uei.toUpperCase() && myCaps) inc01 = 1; // same entity: perfect match
-const tx01  = cosineFromBags(mineBag, txBag)      // 0..1
+        const tx01  = (myCaps && txnBlob) ? cosineFromBags(mineBag, txBag) : 0;
 
-const inc5         = Math.round(inc01 * 5)                             // 0..5
-const tx5          = Math.round(tx01 * 5)                              // 0..5        
-         const combo = Math.round((inc01 + tx01) * 50);
+        const inc5  = Math.round(inc01 * 5);
+        const tx5   = Math.round(tx01 * 5);
+        const combo = Math.round((inc01 + tx01) * 50);
 
         // Map to a unified 0..30 bonus using weights
         const incPoints = Math.round(inc01 * W_INC);
@@ -1121,6 +1048,7 @@ const tx5          = Math.round(tx01 * 5)                              // 0..5
               combined_0to100: combo,
             },
             bonus_0to30: capPoints,
+            weights: { W_TX, W_INC },
             shared_keywords: { sharedInc, sharedTx },
           }),
           { status: 200, headers: { ...headers, "Content-Type": "application/json" } }
@@ -1355,6 +1283,12 @@ const tx5          = Math.round(tx01 * 5)                              // 0..5
         });
       }
 
+      if (!env.OPENAI_API_KEY) {
+        return new Response(JSON.stringify({ ok: false, error: "OPENAI_API_KEY not set" }), {
+          status: 500, headers: { ...headers, "Content-Type": "application/json" },
+        });
+      }
+
       const scorer = new URL(url.toString());
       scorer.pathname = "/sb/bid-nobid";
       scorer.search = `?piid=${encodeURIComponent(piid)}&uei=${encodeURIComponent(uei)}&years=${encodeURIComponent(years)}`;
@@ -1365,12 +1299,6 @@ const tx5          = Math.round(tx01 * 5)                              // 0..5
           JSON.stringify({ ok: false, error: (j && j.error) || "bid-nobid failed" }),
           { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
         );
-      }
-
-      if (!env.OPENAI_API_KEY) {
-        return new Response(JSON.stringify({ ok: false, error: "OPENAI_API_KEY not set" }), {
-          status: 500, headers: { ...headers, "Content-Type": "application/json" },
-        });
       }
 
       const inputs = j.inputs || {};
