@@ -1,4 +1,4 @@
-// worker.js — sb-analytics (DB-first; resilient; includes /fit/capability)
+// worker.js — sb-analytics (DB-first; resilient; includes /fit/capability with explainable, domain-agnostic matching)
 
 import { Client } from "pg";
 
@@ -123,20 +123,48 @@ async function fetchVendorWebsiteByUEI(uei, env) {
   }
 }
 
-/* --- tiny text util for /fit/capability --- */
+/* ---------------- text utils (domain-agnostic) ---------------- */
 const STOP = new Set(
   ("the a an and or of for to from in on at with without into over under before after during " +
    "is are was were be been being by this that these those as it its their his her our your you " +
    "we they them not no yes do does did done can could should would will may might must such " +
-   "any all each other more most some same own per via").split(/\s+/)
+   "any all each other more most some same own per via than then there here where when while " +
+   "subject requirement provide provides provided providing support supports solution solutions " +
+   "services service systems system include includes including perform performs performed performing")
+  .split(/\s+/)
 );
-function tokenize(s) {
+function normalize(s) {
   return String(s || "")
     .toLowerCase()
     .replace(/https?:\/\/\S+/g, " ")
     .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+function tokenize(s) {
+  return normalize(s)
     .split(/\s+/)
     .filter((w) => w && w.length > 2 && !STOP.has(w));
+}
+function bag(words) {
+  const m = new Map();
+  for (const w of words) m.set(w, (m.get(w) || 0) + 1);
+  return m;
+}
+function cosineFromBags(A, B) {
+  let dot = 0, na = 0, nb = 0;
+  for (const [, v] of A) na += v * v;
+  for (const [, v] of B) nb += v * v;
+  for (const [k, va] of A) dot += va * (B.get(k) || 0);
+  const d = Math.sqrt(na) * Math.sqrt(nb);
+  return d ? dot / d : 0;
+}
+function topTermsFrom(text, max = 20) {
+  const b = bag(tokenize(text));
+  return Array.from(b.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, max)
+    .map(([term, freq]) => ({ term, freq }));
 }
 function overlap01(aStr, bStr) {
   const A = new Set(tokenize(aStr));
@@ -144,7 +172,7 @@ function overlap01(aStr, bStr) {
   if (A.size === 0 || B.size === 0) return 0;
   let inter = 0;
   for (const w of A) if (B.has(w)) inter++;
-  const denom = Math.min(A.size, B.size); // optimistic match
+  const denom = Math.min(A.size, B.size);
   return Math.max(0, Math.min(1, inter / denom));
 }
 
@@ -219,46 +247,7 @@ export default {
       }
     }
 
-    /* -------------------- capabilities (SBA view) -------------------- */
-    // GET /sb/capabilities?my=<UEI>&inc=<UEI>
-    // Returns: { ok: true, data: { "<UEI>": "<capabilities_narrative>", ... } }
-    if (last === "capabilities") {
-      const my  = (url.searchParams.get("my")  || "").trim().toUpperCase();
-      const inc = (url.searchParams.get("inc") || "").trim().toUpperCase();
-      const ask = Array.from(new Set([my, inc].filter(Boolean)));
-      if (!ask.length) {
-        return new Response(JSON.stringify({ ok: false, error: "missing UEI" }), {
-          status: 400,
-          headers: { ...headers, "Content-Type": "application/json" },
-        });
-      }
-      const client = makeClient(env);
-      try {
-        await client.connect();
-        await client.query(`SET statement_timeout = '8s'`);
-        const { rows } = await client.query(
-          `SELECT UPPER(uei) AS uei, COALESCE(capabilities_narrative,'') AS cap
-             FROM sba.smallbiz_v
-            WHERE UPPER(uei) = ANY($1::text[])`,
-          [ask]
-        );
-        const data = {};
-        for (const r of rows) data[r.uei] = r.cap || "";
-        return new Response(JSON.stringify({ ok: true, data }), {
-          status: 200,
-          headers: { ...headers, "Content-Type": "application/json" },
-        });
-      } catch (e) {
-        return new Response(
-          JSON.stringify({ ok: false, error: e?.message || "capabilities query failed" }),
-          { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
-        );
-      } finally {
-        try { await client.end(); } catch {}
-      }
-    }
-
-     /* -------------------- sba-caps (get capabilities narratives by UEI) -------------------- */
+    /* -------------------- sba-caps (get capabilities narratives by UEI) -------------------- */
     // GET /sb/sba-caps?uei=<your UEI>&incumbentUei=<prime UEI>
     if (last === "sba-caps") {
       const uei = (url.searchParams.get("uei") || "").trim().toUpperCase();
@@ -276,7 +265,6 @@ export default {
         await client.connect();
         await client.query(`SET statement_timeout = '15s'`);
 
-        // helper: fetch one row from the SBA view
         const fetchOne = async (xUei) => {
           if (!xUei) return null;
           const q = `
@@ -309,11 +297,11 @@ export default {
       }
     }
 
-     /* -------------------- capabilities compare (server-side, stable) -------------------- */
+    /* -------------------- capabilities compare (server-side, stable & explainable) -------------------- */
     /*
       POST /sb/cap-compare
       Body: { my: "<UEI>", inc: "<UEI|null>", txDescs?: string[] }
-      Returns: SBA narratives for both UEIs (when found) + cosine scores and fit bonus.
+      Returns: SBA narratives for both UEIs (when found) + cosine scores, bonus, and an explanation block.
     */
     if (last === "cap-compare" && request.method === "POST") {
       try {
@@ -322,48 +310,9 @@ export default {
         const incUEI = String(body?.inc || "").trim().toUpperCase();
         const txDescs = Array.isArray(body?.txDescs) ? body.txDescs : [];
 
-        const stop = new Set(
-          "the,and,of,to,in,for,on,a,an,with,by,or,as,at,is,are,be,from,this,that,it,its,we,our,their,your,you,us,they,them,was,were,can,will,may,not,no,yes,via,into,over,under,per,performs,provide,provides"
-            .split(",")
-            .map((s) => s.trim())
-        );
-        const normalize = (s) =>
-          String(s || "")
-            .toLowerCase()
-            .replace(/[^a-z0-9\s]/g, " ")
-            .replace(/\s+/g, " ")
-            .trim();
-        const tokens = (s) => normalize(s).split(" ").filter((w) => w && !stop.has(w) && w.length > 2);
-        const vec = (words) => {
-          const m = new Map();
-          for (const w of words) m.set(w, (m.get(w) || 0) + 1);
-          return m;
-        };
-        const cosine = (A, B) => {
-          const a = String(A || "").trim();
-          const b = String(B || "").trim();
-          if (!a || !b) return 0;
-          const va = vec(tokens(a));
-          const vb = vec(tokens(b));
-          let dot = 0,
-            na = 0,
-            nb = 0;
-          for (const [, v] of va) na += v * v;
-          for (const [, v] of vb) nb += v * v;
-          for (const [k, vaK] of va) dot += vaK * (vb.get(k) || 0);
-          const d = Math.sqrt(na) * Math.sqrt(nb);
-          return d ? dot / d : 0;
-        };
-        const bestCosineAgainstMany = (source, many) => {
-          if (!source || !many?.length) return 0;
-          let best = 0;
-          for (const s of many) best = Math.max(best, cosine(source, s));
-          return best;
-        };
-
         const client = makeClient(env);
         let mine = { uei: myUEI, name: null, narrative: "" };
-        let inc = { uei: incUEI || null, name: null, narrative: "" };
+        let inc  = { uei: incUEI || null, name: null, narrative: "" };
 
         try {
           await client.connect();
@@ -387,38 +336,89 @@ export default {
           try { await client.end(); } catch {}
         }
 
-        // Compute scores (server-side, once)
-        const inc01 = cosine(mine.narrative, inc.narrative);                  // 0..1
-        const tx01  = bestCosineAgainstMany(mine.narrative, txDescs || []);   // 0..1
+        // Cosine scores
+        const mineBag = bag(tokenize(mine.narrative));
+        const incBag  = bag(tokenize(inc.narrative));
+        const txBlob  = (txDescs || []).join(" ");
+        const txBag   = bag(tokenize(txBlob));
+
+        const inc01 = (mine.narrative && inc.narrative) ? cosineFromBags(mineBag, incBag) : 0;
+        const tx01  = (mine.narrative && txBlob)        ? cosineFromBags(mineBag, txBag)   : 0;
         const inc5  = Math.round(inc01 * 5);
         const tx5   = Math.round(tx01 * 5);
-        const bonus = Math.round(inc01 * 20) + Math.round(tx01 * 10);         // up to +30
-        const combined100 = Math.round((inc01 + tx01) * 50);
+        const bonus = Math.round(inc01 * 20) + Math.round(tx01 * 10);       // up to +30
+        const combined100 = Math.round((inc01 + tx01) * 50);                // 0..100
+
+        // Explainability (domain-agnostic)
+        const anchors = topTermsFrom(mine.narrative, 15);                    // what YOU emphasize
+        const incTop  = topTermsFrom(inc.narrative, 20);
+        const txTop   = topTermsFrom(txBlob, 20);
+
+        const setFrom = (arr) => {
+          const m = new Map();
+          for (const { term, freq } of arr) m.set(term, freq);
+          return m;
+        };
+        const incMap = setFrom(incTop);
+        const txMap  = setFrom(txTop);
+
+        const topOverlapInc = anchors
+          .filter(a => incMap.has(a.term))
+          .map(a => ({ term: a.term, my: a.freq, other: incMap.get(a.term) }))
+          .sort((x, y) => (y.my + y.other) - (x.my + x.other))
+          .slice(0, 12);
+
+        const topOverlapTx = anchors
+          .filter(a => txMap.has(a.term))
+          .map(a => ({ term: a.term, my: a.freq, tx: txMap.get(a.term) }))
+          .sort((x, y) => (y.my + y.tx) - (x.my + x.tx))
+          .slice(0, 12);
+
+        // simple “reasons” from transactions: pick lines that contain anchor terms
+        const txReasons = [];
+        if (txDescs?.length) {
+          const wanted = new Set([...topOverlapTx.map(t => t.term)]);
+          for (const s of txDescs) {
+            const n = normalize(s);
+            for (const w of wanted) {
+              if (n.includes(w)) { txReasons.push(s); break; }
+            }
+            if (txReasons.length >= 5) break;
+          }
+        }
+
+        const explain = {
+          anchorsHit: anchors.map(a => ({ anchor: a.term, hits: a.freq })),
+          topOverlapInc,
+          topOverlapTx,
+          txReasons,
+          notes: [
+            anchors.length ? "Anchors derived from your SBA narrative (most frequent meaningful terms)." : "No anchors found in your SBA narrative.",
+            topOverlapInc.length ? "Shared terms with incumbent narrative indicate capability proximity." : "Few/no shared terms with incumbent narrative.",
+            topOverlapTx.length ? "Shared terms with transaction descriptions show work alignment." : "Few/no shared terms with transaction descriptions."
+          ]
+        };
 
         const res = {
           ok: true,
           mine,
           incumbent: inc,
           scores: {
-            inc01,
-            tx01,
-            inc5,
-            tx5,
-            combined100,
-            bonus,
+            inc01, tx01, inc5, tx5, combined100, bonus,
             uiNote:
               mine.narrative || inc.narrative
                 ? `Capabilities match: combined ${combined100}/100 · vs incumbent ${inc5}/5 · vs transactions ${tx5}/5 (+${bonus})`
                 : "Capabilities match: no narratives found",
-            memoA:
-              mine.narrative && inc.narrative
-                ? `Capabilities comparison (your SBA narrative ↔ incumbent): ${inc5}/5.`
-                : "Capabilities comparison (your narrative vs incumbent): 0/5 (no narratives found).",
-            memoB:
-              mine.narrative
-                ? `Capabilities comparison (your SBA narrative ↔ transaction descriptions): ${tx5}/5.`
-                : "Capabilities comparison (your narrative vs transaction descriptions): 0/5 (no narrative to match).",
           },
+          memoA:
+            mine.narrative && inc.narrative
+              ? `Capabilities comparison (your SBA narrative ↔ incumbent): ${inc5}/5.`
+              : "Capabilities comparison (your narrative vs incumbent): 0/5 (no narratives found).",
+          memoB:
+            mine.narrative
+              ? `Capabilities comparison (your SBA narrative ↔ transaction descriptions): ${tx5}/5.`
+              : "Capabilities comparison (your narrative vs transaction descriptions): 0/5 (no narrative to match).",
+          explain,
         };
 
         return new Response(JSON.stringify(res), {
@@ -460,7 +460,7 @@ export default {
             award_id_piid           AS piid,
             award_key               AS award_key,
             awarding_agency_name    AS agency,
-            recipient_name          AS incumbent,        -- ensure a name lands
+            recipient_name          AS incumbent,
             naics_code              AS naics,
             pop_current_end_date    AS end_date,
             potential_total_value_of_award_num AS value
@@ -786,6 +786,15 @@ export default {
           description: r.transaction_description || "",
         }));
 
+        // also include raw transactions (so UI can build txDescs for /cap-compare)
+        const transactions = (txRes.rows || []).map((r) => ({
+          date: r.action_date ? String(r.action_date) : null,
+          description: r.transaction_description || "",
+          mod: r.modification_number || "",
+          type: r.action_type || "",
+          obligation: Number(r.obligation || 0),
+        }));
+
         const payload = {
           ok: true,
           piid,
@@ -798,6 +807,7 @@ export default {
             potential_total_value_of_award: s.potential_total_value_of_award ?? null,
           },
           spendPoints,
+          transactions,
         };
 
         const res = new Response(JSON.stringify(payload), {
