@@ -298,140 +298,120 @@ export default {
     }
 
     /* -------------------- capabilities compare (server-side, stable & explainable) -------------------- */
-    /*
-      POST /sb/cap-compare
-      Body: { my: "<UEI>", inc: "<UEI|null>", txDescs?: string[] }
-      Returns: SBA narratives for both UEIs (when found) + cosine scores, bonus, and an explanation block.
-    */
-    if (last === "cap-compare" && request.method === "POST") {
-      try {
-        const body = await request.json().catch(() => ({}));
-        const myUEI = String(body?.my || "").trim().toUpperCase();
-        const incUEI = String(body?.inc || "").trim().toUpperCase();
-        const txDescs = Array.isArray(body?.txDescs) ? body.txDescs : [];
+/*
+  POST /sb/cap-compare
+  Body: { my: "<UEI>", inc: "<UEI|null>", txDescs?: string[] }
+  Returns: SBA narratives for both UEIs (when found) + cosine scores, bonus, and an explanation block.
+*/
+if (last === "cap-compare" && request.method === "POST") {
+  try {
+    const body = await request.json().catch(() => ({}));
+    const myUEI = String(body?.my || "").trim().toUpperCase();
+    const incUEI = String(body?.inc || "").trim().toUpperCase();
+    const txDescs = Array.isArray(body?.txDescs) ? body.txDescs : [];
 
-        const client = makeClient(env);
-        let mine = { uei: myUEI, name: null, narrative: "" };
-        let inc  = { uei: incUEI || null, name: null, narrative: "" };
+    const client = makeClient(env);
+    let mine = { uei: myUEI, name: null, narrative: "" };
+    let inc  = { uei: incUEI || null, name: null, narrative: "" };
 
-        try {
-          await client.connect();
-          await client.query(`SET statement_timeout = '12s'`);
+    try {
+      await client.connect();
+      await client.query(`SET statement_timeout = '12s'`);
 
-          const sql = `
-            select uei, business_name as name, coalesce(nullif(capabilities_narrative,''), '') as narrative
-            from sba.smallbiz_v
-            where upper(uei) = upper($1)
-            limit 1`;
+      const sql = `
+        select uei, business_name as name, coalesce(nullif(capabilities_narrative,''), '') as narrative
+        from sba.smallbiz_v
+        where upper(uei) = upper($1)
+        limit 1`;
 
-          if (myUEI) {
-            const r1 = await client.query(sql, [myUEI]);
-            if (r1?.rows?.length) mine = { ...mine, ...r1.rows[0] };
-          }
-          if (incUEI) {
-            const r2 = await client.query(sql, [incUEI]);
-            if (r2?.rows?.length) inc = { ...inc, ...r2.rows[0] };
-          }
-        } finally {
-          try { await client.end(); } catch {}
-        }
-
-        // Cosine scores
-        const mineBag = bag(tokenize(mine.narrative));
-        const incBag  = bag(tokenize(inc.narrative));
-        const txBlob  = (txDescs || []).join(" ");
-        const txBag   = bag(tokenize(txBlob));
-
-        const inc01 = (mine.narrative && inc.narrative) ? cosineFromBags(mineBag, incBag) : 0;
-        const tx01  = (mine.narrative && txBlob)        ? cosineFromBags(mineBag, txBag)   : 0;
-        const inc5  = Math.round(inc01 * 5);
-        const tx5   = Math.round(tx01 * 5);
-        const bonus = Math.round(inc01 * 20) + Math.round(tx01 * 10);       // up to +30
-        const combined100 = Math.round((inc01 + tx01) * 50);                // 0..100
-
-        // Explainability (domain-agnostic)
-        const anchors = topTermsFrom(mine.narrative, 15);                    // what YOU emphasize
-        const incTop  = topTermsFrom(inc.narrative, 20);
-        const txTop   = topTermsFrom(txBlob, 20);
-
-        const setFrom = (arr) => {
-          const m = new Map();
-          for (const { term, freq } of arr) m.set(term, freq);
-          return m;
-        };
-        const incMap = setFrom(incTop);
-        const txMap  = setFrom(txTop);
-
-        const topOverlapInc = anchors
-          .filter(a => incMap.has(a.term))
-          .map(a => ({ term: a.term, my: a.freq, other: incMap.get(a.term) }))
-          .sort((x, y) => (y.my + y.other) - (x.my + x.other))
-          .slice(0, 12);
-
-        const topOverlapTx = anchors
-          .filter(a => txMap.has(a.term))
-          .map(a => ({ term: a.term, my: a.freq, tx: txMap.get(a.term) }))
-          .sort((x, y) => (y.my + y.tx) - (x.my + x.tx))
-          .slice(0, 12);
-
-        // simple “reasons” from transactions: pick lines that contain anchor terms
-        const txReasons = [];
-        if (txDescs?.length) {
-          const wanted = new Set([...topOverlapTx.map(t => t.term)]);
-          for (const s of txDescs) {
-            const n = normalize(s);
-            for (const w of wanted) {
-              if (n.includes(w)) { txReasons.push(s); break; }
-            }
-            if (txReasons.length >= 5) break;
-          }
-        }
-
-        const explain = {
-          anchorsHit: anchors.map(a => ({ anchor: a.term, hits: a.freq })),
-          topOverlapInc,
-          topOverlapTx,
-          txReasons,
-          notes: [
-            anchors.length ? "Anchors derived from your SBA narrative (most frequent meaningful terms)." : "No anchors found in your SBA narrative.",
-            topOverlapInc.length ? "Shared terms with incumbent narrative indicate capability proximity." : "Few/no shared terms with incumbent narrative.",
-            topOverlapTx.length ? "Shared terms with transaction descriptions show work alignment." : "Few/no shared terms with transaction descriptions."
-          ]
-        };
-
-        const res = {
-          ok: true,
-          mine,
-          incumbent: inc,
-          scores: {
-            inc01, tx01, inc5, tx5, combined100, bonus,
-            uiNote:
-              mine.narrative || inc.narrative
-                ? `Capabilities match: combined ${combined100}/100 · vs incumbent ${inc5}/5 · vs transactions ${tx5}/5 (+${bonus})`
-                : "Capabilities match: no narratives found",
-          },
-          memoA:
-            mine.narrative && inc.narrative
-              ? `Capabilities comparison (your SBA narrative ↔ incumbent): ${inc5}/5.`
-              : "Capabilities comparison (your narrative vs incumbent): 0/5 (no narratives found).",
-          memoB:
-            mine.narrative
-              ? `Capabilities comparison (your SBA narrative ↔ transaction descriptions): ${tx5}/5.`
-              : "Capabilities comparison (your narrative vs transaction descriptions): 0/5 (no narrative to match).",
-          explain,
-        };
-
-        return new Response(JSON.stringify(res), {
-          status: 200,
-          headers: { ...headers, "Content-Type": "application/json" },
-        });
-      } catch (e) {
-        return new Response(
-          JSON.stringify({ ok: false, error: e?.message || "cap compare failed" }),
-          { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
-        );
+      if (myUEI) {
+        const r1 = await client.query(sql, [myUEI]);
+        if (r1?.rows?.length) mine = { ...mine, ...r1.rows[0] };
       }
+      if (incUEI) {
+        const r2 = await client.query(sql, [incUEI]);
+        if (r2?.rows?.length) inc = { ...inc, ...r2.rows[0] };
+      }
+    } finally {
+      try { await client.end(); } catch {}
     }
+
+    // Cosine vs incumbent (0..1)
+    const mineBag = bag(tokenize(mine.narrative));
+    const incBag  = bag(tokenize(inc.narrative));
+    const inc01   = (mine.narrative && inc.narrative) ? cosineFromBags(mineBag, incBag) : 0;
+
+    // Transactions “all-or-nothing”: any overlap => full credit
+    const txBlob = (txDescs || []).join(" ");
+    const myTermsSet = new Set(tokenize(mine.narrative));
+    const txTermsSet = new Set(tokenize(txBlob));
+    let txAnyHit = false;
+    if (myTermsSet.size && txTermsSet.size) {
+      for (const w of myTermsSet) { if (txTermsSet.has(w)) { txAnyHit = true; break; } }
+    }
+    const tx01 = txAnyHit ? 1 : 0;
+
+    const inc5  = Math.round(inc01 * 5);
+    const tx5   = txAnyHit ? 5 : 0;
+    const bonus = Math.round(inc01 * 20) + (txAnyHit ? 10 : 0); // up to +30
+    const combined100 = Math.round(((inc01 + tx01) / 2) * 100); // 0..100
+
+    // Explainability
+    const anchors = topTermsFrom(mine.narrative, 15);
+    const setFrom = (arr) => { const m = new Map(); for (const {term, freq} of arr) m.set(term, freq); return m; };
+    const txTop = topTermsFrom(txBlob, 20);
+    const txMap = setFrom(txTop);
+
+    const topOverlapTx = anchors
+      .filter(a => txMap.has(a.term))
+      .map(a => ({ term: a.term, my: a.freq, tx: txMap.get(a.term) }))
+      .sort((x, y) => (y.my + y.tx) - (x.my + x.tx))
+      .slice(0, 12);
+
+    const explain = {
+      anchorsHit: anchors.map(a => ({ anchor: a.term, hits: a.freq })),
+      topOverlapTx,
+      txAnyHit,
+      notes: [
+        anchors.length ? "Anchors derived from your SBA narrative." : "No anchors found in your narrative.",
+        txAnyHit ? "At least one anchor term appears in transaction descriptions (full TX credit)." :
+                   "No anchor terms found in transaction descriptions (no TX credit)."
+      ]
+    };
+
+    const res = {
+      ok: true,
+      mine,
+      incumbent: inc,
+      scores: {
+        inc01, tx01, inc5, tx5, combined100, bonus,
+        uiNote:
+          mine.narrative || inc.narrative
+            ? `Capabilities match: combined ${combined100}/100 · vs incumbent ${inc5}/5 · vs transactions ${tx5}/5 (+${bonus})`
+            : "Capabilities match: no narratives found",
+      },
+      memoA:
+        mine.narrative && inc.narrative
+          ? `Capabilities comparison (your SBA narrative ↔ incumbent): ${inc5}/5.`
+          : "Capabilities comparison (your narrative vs incumbent): 0/5 (no narratives found).",
+      memoB:
+        txAnyHit
+          ? "Capabilities comparison (your SBA narrative ↔ transaction descriptions): 5/5."
+          : "Capabilities comparison (your narrative vs transaction descriptions): 0/5.",
+      explain,
+    };
+
+    return new Response(JSON.stringify(res), {
+      status: 200,
+      headers: { ...headers, "Content-Type": "application/json" },
+    });
+  } catch (e) {
+    return new Response(
+      JSON.stringify({ ok: false, error: e?.message || "cap compare failed" }),
+      { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
+    );
+  }
+}
 
     /* -------------------- expiring-contracts (cached 5m) -------------------- */
     if (last === "expiring-contracts") {
