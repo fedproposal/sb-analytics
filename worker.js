@@ -303,97 +303,121 @@ export default {
       Body: { my: "<UEI>", inc: "<UEI|null>", txDescs?: string[] }
       Returns: SBA narratives for both UEIs (when found) + 5/5 hit tests, bonus, and an explanation block with matched terms.
     */
-    if (last === "cap-compare" && request.method === "POST") {
-      try {
-        const body = await request.json().catch(() => ({}));
-        const myUEI = String(body?.my || "").trim().toUpperCase();
-        const incUEI = String(body?.inc || "").trim().toUpperCase();
-        const txDescs = Array.isArray(body?.txDescs) ? body.txDescs : [];
+// PATCH: Drop-in replacement for the /sb/cap-compare handler inside your Worker
+// Purpose: Make response shape match OpportunityFit.tsx expectations
+// Change: memoA and memoB are now nested INSIDE `scores` (so TSX can read s.memoA / s.memoB)
 
-        const client = makeClient(env);
-        let mine = { uei: myUEI, name: null, narrative: "" };
-        let inc  = { uei: incUEI || null, name: null, narrative: "" };
+if (last === "cap-compare" && request.method === "POST") {
+  try {
+    const body = await request.json().catch(() => ({}));
+    const myUEI = String(body?.my || "").trim().toUpperCase();
+    const incUEI = String(body?.inc || "").trim().toUpperCase();
+    const txDescs = Array.isArray(body?.txDescs) ? body.txDescs : [];
 
-        try {
-          await client.connect();
-          await client.query(`SET statement_timeout = '12s'`);
+    const client = makeClient(env);
+    let mine = { uei: myUEI, name: null, narrative: "" };
+    let inc  = { uei: incUEI || null, name: null, narrative: "" };
 
-          const sql = `
-            select uei, business_name as name, coalesce(nullif(capabilities_narrative,''), '') as narrative
-            from sba.smallbiz_v
-            where upper(uei) = upper($1)
-            limit 1`;
+    try {
+      await client.connect();
+      await client.query(`SET statement_timeout = '12s'`);
 
-          if (myUEI) {
-            const r1 = await client.query(sql, [myUEI]);
-            if (r1?.rows?.length) mine = { ...mine, ...r1.rows[0] };
-          }
-          if (incUEI) {
-            const r2 = await client.query(sql, [incUEI]);
-            if (r2?.rows?.length) inc = { ...inc, ...r2.rows[0] };
-          }
-        } finally {
-          try { await client.end(); } catch {}
-        }
+      const sql = `
+        select uei, business_name as name, coalesce(nullif(capabilities_narrative,''), '') as narrative
+        from sba.smallbiz_v
+        where upper(uei) = upper($1)
+        limit 1`;
 
-        // Anchor terms from your SBA narrative
-        const anchors = topTermsFrom(mine.narrative || "", 25).map(x => x.term);
-        const incNorm = normalize(inc.narrative || "");
-        const txBlob  = (txDescs || []).join(" ");
-        const txNorm  = normalize(txBlob);
+      if (myUEI) {
+        const r1 = await client.query(sql, [myUEI]);
+        if (r1?.rows?.length) mine = { ...mine, ...r1.rows[0] };
+      }
+      if (incUEI) {
+        const r2 = await client.query(sql, [incUEI]);
+        if (r2?.rows?.length) inc = { ...inc, ...r2.rows[0] };
+      }
+    } finally {
+      try { await client.end(); } catch {}
+    }
 
-        // Count helper
-        const countMatches = (normText, terms) => {
-          const out = [];
-          if (!normText) return out;
-          for (const t of terms) {
-            if (!t) continue;
-            const re = new RegExp(`\\b${t}\\b`, "g");
-            const m = normText.match(re);
-            if (m && m.length) out.push({ term: t, count: m.length });
-          }
-          return out.sort((a,b) => b.count - a.count).slice(0, 12);
-        };
+    // Anchor terms from your SBA narrative
+    const anchors = topTermsFrom(mine.narrative || "", 25).map(x => x.term);
+    const incNorm = normalize(inc.narrative || "");
+    const txBlob  = (txDescs || []).join(" ");
+    const txNorm  = normalize(txBlob);
 
-        const incMatches = countMatches(incNorm, anchors);
-        const txMatches  = countMatches(txNorm, anchors);
+    // Count helper
+    const countMatches = (normText, terms) => {
+      const out = [];
+      if (!normText) return out;
+      for (const t of terms) {
+        if (!t) continue;
+        const re = new RegExp(`\\b${t}\\b`, "g");
+        const m = normText.match(re);
+        if (m && m.length) out.push({ term: t, count: m.length });
+      }
+      return out.sort((a,b) => b.count - a.count).slice(0, 12);
+    };
 
-        // All-or-nothing 5/5 scoring
-        const inc5 = incMatches.length > 0 ? 5 : 0;
-        const tx5  = txMatches.length  > 0 ? 5 : 0;
+    const incMatches = countMatches(incNorm, anchors);
+    const txMatches  = countMatches(txNorm, anchors);
 
-        // Bonus & combined (keep your previous scale)
-        const bonus = (inc5 ? 20 : 0) + (tx5 ? 10 : 0);       // up to +30
-        const combined100 = (inc5 ? 50 : 0) + (tx5 ? 50 : 0); // 0..100
+    // All-or-nothing 5/5 scoring
+    const inc5 = incMatches.length > 0 ? 5 : 0;
+    const tx5  = txMatches.length  > 0 ? 5 : 0;
 
-        const uiNote =
-          `Capabilities match: combined ${combined100}/100 · ` +
-          `vs incumbent ${inc5}/5 · vs transactions ${tx5}/5 ` +
-          `(+${bonus})`;
+    // Bonus & combined (keep your scale)
+    const bonus = (inc5 ? 20 : 0) + (tx5 ? 10 : 0);       // up to +30
+    const combined100 = (inc5 ? 50 : 0) + (tx5 ? 50 : 0); // 0..100
 
-        const res = {
-          ok: true,
-          mine,
-          incumbent: inc,
-          scores: { inc5, tx5, bonus, combined100, uiNote },
-          memoA:
-            inc5 === 5
-              ? "Capabilities comparison (your SBA narrative ↔ incumbent): 5/5."
-              : "Capabilities comparison (your SBA narrative ↔ incumbent): 0/5.",
-          memoB:
-            tx5 === 5
-              ? "Capabilities comparison (your SBA narrative ↔ transaction descriptions): 5/5."
-              : "Capabilities comparison (your SBA narrative ↔ transaction descriptions): 0/5.",
-          explain: {
-            anchors,
-            incMatches,
-            txMatches,
-            notes: [
-              "All-or-nothing checks: if any of your anchor terms appear, score is 5/5.",
-              "incMatches and txMatches list the specific matched terms with counts."
-            ],
-          },
-        };
+    const uiNote =
+      `Capabilities match: combined ${combined100}/100 · ` +
+      `vs incumbent ${inc5}/5 · vs transactions ${tx5}/5 ` +
+      `(+${bonus})`;
+
+    // ✔ CHANGE HERE: memoA/memoB moved inside scores
+    const scores = {
+      inc5,
+      tx5,
+      bonus,
+      combined100,
+      uiNote,
+      memoA: inc5 === 5
+        ? "Capabilities comparison (your SBA narrative ↔ incumbent): 5/5."
+        : "Capabilities comparison (your SBA narrative ↔ incumbent): 0/5.",
+      memoB: tx5 === 5
+        ? "Capabilities comparison (your SBA narrative ↔ transaction descriptions): 5/5."
+        : "Capabilities comparison (your SBA narrative ↔ transaction descriptions): 0/5.",
+    };
+
+    const res = {
+      ok: true,
+      mine,
+      incumbent: inc,
+      scores,
+      explain: {
+        anchors,
+        incMatches,
+        txMatches,
+        notes: [
+          "All-or-nothing checks: if any of your anchor terms appear, score is 5/5.",
+          "incMatches and txMatches list the specific matched terms with counts.",
+        ],
+      },
+    };
+
+    return new Response(JSON.stringify(res), {
+      status: 200,
+      headers: { ...headers, "Content-Type": "application/json" },
+    });
+  } catch (e) {
+    return new Response(
+      JSON.stringify({ ok: false, error: e?.message || "cap compare failed" }),
+      { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
+    );
+  }
+}
+
 
         return new Response(JSON.stringify(res), {
           status: 200,
