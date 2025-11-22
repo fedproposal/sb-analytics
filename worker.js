@@ -1021,6 +1021,11 @@ export default {
         });
       }
 
+      // Optional tunable weights (default 18 + 12 = 30 total)
+      const W_INC = Math.max(0, Math.min(30, Number(body?.weights?.inc_vs_my ?? 18)));
+      const W_TX  = Math.max(0, Math.min(30 - W_INC, Number(body?.weights?.my_vs_tx ?? 12)));
+      const P_MAX = 30;
+
       const client = makeClient(env);
       try {
         await client.connect();
@@ -1071,14 +1076,43 @@ export default {
         );
         const txnBlob = (tx.rows || []).map((r) => String(r.transaction_description || "")).join(" ");
 
-        // Compute overlaps (0..1), map to 0..5
-        const inc01 = incUEI && incCaps ? overlap01(myCaps, incCaps) : 0;
-        const txn01 = txnBlob ? overlap01(myCaps, txnBlob) : 0;
-        const incScore = Math.round(inc01 * 5 * 10) / 10; // 0..5 (1 decimal)
-        const txnScore = Math.round(txn01 * 5 * 10) / 10;
+        // Unified cosine scoring (aligns with /sb/cap-compare)
+        const mineBag = bag(tokenize(myCaps));
+        const incBag  = bag(tokenize(incCaps));
+        const txBag   = bag(tokenize(txnBlob));
 
-        // Combined 0..100 (60% incumbent, 40% transactions)
-        const combo = Math.round(((inc01 * 0.6) + (txn01 * 0.4)) * 100);
+        let inc01 = (myCaps && incCaps) ? cosineFromBags(mineBag, incBag) : 0;
+        if (incUEI && uei && incUEI.toUpperCase() === uei.toUpperCase() && myCaps) inc01 = 1; // same entity: perfect match
+        const tx01 = (myCaps && txnBlob) ? cosineFromBags(mineBag, txBag) : 0;
+
+        const inc5  = Math.round(inc01 * 5);
+        const tx5   = Math.round(tx01 * 5);
+        const combo = Math.round((inc01 + tx01) * 50);
+
+        // Map to a unified 0..30 bonus using weights
+        const incPoints = Math.round(inc01 * W_INC);
+        const txPoints  = Math.round(tx01  * W_TX);
+        const capPoints = Math.max(0, Math.min(P_MAX, incPoints + txPoints));
+
+        // Optional: shared keywords for UI/explain
+        const anchors = topTermsFrom(myCaps, 15);
+        const incTop  = topTermsFrom(incCaps, 20);
+        const txTop   = topTermsFrom(txnBlob, 20);
+        const mapFrom = (arr) => { const m = new Map(); for (const { term, freq } of arr) m.set(term, freq); return m; };
+        const incMap = mapFrom(incTop);
+        const txMap  = mapFrom(txTop);
+
+        const sharedInc = anchors
+          .filter(a => incMap.has(a.term))
+          .map(a => ({ term: a.term, mine: a.freq, inc: incMap.get(a.term) }))
+          .sort((x, y) => (y.mine + y.inc) - (x.mine + x.inc))
+          .slice(0, 12);
+
+        const sharedTx = anchors
+          .filter(a => txMap.has(a.term))
+          .map(a => ({ term: a.term, mine: a.freq, tx: txMap.get(a.term) }))
+          .sort((x, y) => (y.mine + y.tx) - (x.mine + x.tx))
+          .slice(0, 12);
 
         return new Response(
           JSON.stringify({
@@ -1087,10 +1121,12 @@ export default {
             uei,
             incumbent_uei: incUEI,
             scores: {
-              cap_vs_incumbent_0to5: incScore,
-              cap_vs_txn_0to5: txnScore,
+              cap_vs_incumbent_0to5: inc5,
+              cap_vs_txn_0to5: tx5,
               combined_0to100: combo,
             },
+            bonus_0to30: capPoints,
+            shared_keywords: { sharedInc, sharedTx },
           }),
           { status: 200, headers: { ...headers, "Content-Type": "application/json" } }
         );
