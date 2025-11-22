@@ -1,4 +1,4 @@
-// worker.js — sb-analytics (DB-first; resilient; includes /cap-compare with continuous weighting and /fit/capability fix)
+// worker.js — sb-analytics (DB-first; resilient; includes /fit/capability with explainable, domain-agnostic matching)
 
 import { Client } from "pg";
 
@@ -131,19 +131,19 @@ const STOP = new Set(
    "any all each other more most some same own per via than then there here where when while " +
    "subject requirement provide provides provided providing support supports solution solutions " +
    "services service systems system include includes including perform performs performed performing")
-  .split(/\s+/)
+  .split(/\\s+/)
 );
 function normalize(s) {
   return String(s || "")
     .toLowerCase()
-    .replace(/https?:\/\/\S+/g, " ")
-    .replace(/[^a-z0-9\s]/g, " ")
-    .replace(/\s+/g, " ")
+    .replace(/https?:\\/\\/\\S+/g, " ")
+    .replace(/[^a-z0-9\\s]/g, " ")
+    .replace(/\\s+/g, " ")
     .trim();
 }
 function tokenize(s) {
   return normalize(s)
-    .split(/\s+/)
+    .split(/\\s+/)
     .filter((w) => w && w.length > 2 && !STOP.has(w));
 }
 function bag(words) {
@@ -165,15 +165,6 @@ function topTermsFrom(text, max = 20) {
     .sort((a, b) => b[1] - a[1])
     .slice(0, max)
     .map(([term, freq]) => ({ term, freq }));
-}
-function overlap01(aStr, bStr) {
-  const A = new Set(tokenize(aStr));
-  const B = new Set(tokenize(bStr));
-  if (A.size === 0 || B.size === 0) return 0;
-  let inter = 0;
-  for (const w of A) if (B.has(w)) inter++;
-  const denom = Math.min(A.size, B.size);
-  return Math.max(0, Math.min(1, inter / denom));
 }
 
 /* =====================================================================
@@ -217,15 +208,15 @@ export default {
       try {
         await client.connect();
         await client.query(`SET statement_timeout = '20s'`);
-        const mkSQL = (t) => `
+        const mkSQL = (t) => \`
           SELECT DISTINCT name FROM (
-            SELECT awarding_agency_name      AS name FROM ${t} WHERE awarding_agency_name IS NOT NULL
+            SELECT awarding_agency_name      AS name FROM \${t} WHERE awarding_agency_name IS NOT NULL
             UNION
-            SELECT awarding_sub_agency_name AS name FROM ${t} WHERE awarding_sub_agency_name IS NOT NULL
+            SELECT awarding_sub_agency_name AS name FROM \${t} WHERE awarding_sub_agency_name IS NOT NULL
             UNION
-            SELECT awarding_office_name     AS name FROM ${t} WHERE awarding_office_name IS NOT NULL
+            SELECT awarding_office_name     AS name FROM \${t} WHERE awarding_office_name IS NOT NULL
           ) x WHERE name IS NOT NULL
-          ORDER BY name LIMIT 400`;
+          ORDER BY name LIMIT 400\`;
         const { rows } = await queryPreferringFast(client, mkSQL, []);
         const res = new Response(JSON.stringify({ ok: true, rows }), {
           status: 200,
@@ -267,7 +258,7 @@ export default {
 
         const fetchOne = async (xUei) => {
           if (!xUei) return null;
-          const q = `
+          const q = \`
             SELECT
               uei,
               business_name,
@@ -275,7 +266,7 @@ export default {
             FROM sba.smallbiz_v
             WHERE UPPER(uei) = $1
             ORDER BY NULLIF(TRIM(last_updated_date), '') DESC NULLS LAST
-            LIMIT 1`;
+            LIMIT 1\`;
           const { rows } = await client.query(q, [xUei]);
           return rows?.[0] || null;
         };
@@ -297,11 +288,10 @@ export default {
       }
     }
 
-    /* -------------------- capabilities compare (continuous weighting; explainable) -------------------- */
+    /* -------------------- capabilities compare (cosine-based; explainable) -------------------- */
     /*
       POST /sb/cap-compare
       Body: { my: "<UEI>", inc: "<UEI|null>", txDescs?: string[] }
-      Returns: SBA narratives for both UEIs (when found) + 0–5 subscores, 0–30 bonus (weighted, TX-heavy), combined100, and explain.
     */
     if (last === "cap-compare" && request.method === "POST") {
       try {
@@ -316,13 +306,13 @@ export default {
 
         try {
           await client.connect();
-          await client.query(`SET statement_timeout = '12s'`);
+          await client.query(\`SET statement_timeout = '12s'\`);
 
-          const sql = `
+          const sql = \`
             select uei, business_name as name, coalesce(nullif(capabilities_narrative,''), '') as narrative
             from sba.smallbiz_v
             where upper(uei) = upper($1)
-            limit 1`;
+            limit 1\`;
 
           if (myUEI) {
             const r1 = await client.query(sql, [myUEI]);
@@ -336,80 +326,41 @@ export default {
           try { await client.end(); } catch {}
         }
 
-        // Build signals
-        const myText = mine.narrative || "";
-        const incText = inc.narrative || "";
-        const txBlob = (txDescs || []).join(" ");
+        // Cosine on narratives + transactions
+        const myCaps = mine.narrative || "";
+        const incCaps = inc.narrative || "";
+        const txBlob  = (txDescs || []).join(" ");
 
-        // Sparse-safe cosine
-        const mineBag = bag(tokenize(myText));
-        const incBag  = bag(tokenize(incText));
+        const mineBag = bag(tokenize(myCaps));
+        const incBag  = bag(tokenize(incCaps));
         const txBag   = bag(tokenize(txBlob));
 
-        let inc01 = (myText && incText) ? cosineFromBags(mineBag, incBag) : 0;
-        const tx01  = (myText && txBlob) ? cosineFromBags(mineBag, txBag) : 0;
+        let inc01 = (myCaps && incCaps) ? cosineFromBags(mineBag, incBag) : 0;
+        if (incUEI && myUEI && incUEI.toUpperCase() === myUEI.toUpperCase() && myCaps) inc01 = 1; // same entity: perfect
 
-        // If same entity (you are the incumbent), force perfect incumbent overlap
-        if (incUEI && myUEI && incUEI.toUpperCase() === myUEI.toUpperCase() && myText) inc01 = 1;
+        const tx01  = (myCaps && txBlob) ? cosineFromBags(mineBag, txBag) : 0;
 
-        // Weighted bonus (TX heavier than INC) -> 0..30
-        const W_TX  = 18;
-        const W_INC = 12;
-        const bonus = Math.round(tx01 * W_TX + inc01 * W_INC);
-
-        // Normalized 0..5 subscores + combined 0..100
-        const inc5 = Math.round(inc01 * 5);
-        const tx5  = Math.round(tx01 * 5);
-        const combined100 = Math.round((inc01 + tx01) * 50);
-
-        // Matched terms (anchors from your narrative against others)
-        const anchors = topTermsFrom(myText, 25).map(x => x.term);
-        const normInc = normalize(incText);
-        const normTx  = normalize(txBlob);
-
-        const countMatches = (normText, terms) => {
-          const out = [];
-          if (!normText) return out;
-          for (const t of terms) {
-            if (!t) continue;
-            const re = new RegExp(`\\b${t}\\b`, "g");
-            const m = normText.match(re);
-            if (m && m.length) out.push({ term: t, count: m.length });
-          }
-          return out.sort((a,b) => b.count - a.count).slice(0, 12);
-        };
-
-        const incMatches = countMatches(normInc, anchors);
-        const txMatches  = countMatches(normTx,  anchors);
+        const inc5  = Math.round(inc01 * 5);
+        const tx5   = Math.round(tx01 * 5);
+        const combined100 = Math.round((inc01 + tx01) * 50); // 0..100
 
         const uiNote =
-          `Capabilities match: combined ${combined100}/100 · ` +
-          `vs incumbent ${inc5}/5 · vs transactions ${tx5}/5 ` +
-          `(+${bonus})`;
+          \`Capabilities match: combined \${combined100}/100 · vs incumbent \${inc5}/5 · vs transactions \${tx5}/5\`;
+
+        const anchors = topTermsFrom(myCaps, 25).map(x => x.term);
 
         const res = {
           ok: true,
           mine,
           incumbent: inc,
           scores: {
-            inc5, tx5, bonus, combined100, uiNote,
-            memoA: inc5 >= 4
-              ? "Capabilities comparison (your SBA narrative ↔ incumbent): strong."
-              : inc5 >= 2
-              ? "Capabilities comparison (your SBA narrative ↔ incumbent): moderate."
-              : "Capabilities comparison (your SBA narrative ↔ incumbent): weak.",
-            memoB: tx5 >= 4
-              ? "Capabilities comparison (your SBA narrative ↔ transaction descriptions): strong."
-              : tx5 >= 2
-              ? "Capabilities comparison (your SBA narrative ↔ transaction descriptions): moderate."
-              : "Capabilities comparison (your SBA narrative ↔ transaction descriptions): weak.",
+            inc5, tx5, combined100,
+            bonus: Math.round((inc01 * 20) + (tx01 * 30)), // legacy field; not used by UI math now
+            uiNote,
+            memoA: \`Capabilities comparison (your SBA narrative ↔ incumbent): \${inc5}/5.\`,
+            memoB: \`Capabilities comparison (your SBA narrative ↔ transaction descriptions): \${tx5}/5.\`,
           },
-          explain: {
-            anchors,
-            incMatches,
-            txMatches,
-            weights: { W_TX, W_INC },
-          },
+          explain: { anchors },
         };
 
         return new Response(JSON.stringify(res), {
@@ -436,7 +387,7 @@ export default {
         });
       }
 
-      const mkSQL = (t) => `
+      const mkSQL = (t) => \`
         SELECT
           award_id_piid            AS piid,
           fiscal_year,
@@ -450,7 +401,7 @@ export default {
           extent_competed,
           number_of_offers_received,
           total_dollars_obligated_num AS obligated
-        FROM ${t}
+        FROM \${t}
         WHERE recipient_uei = $1
           AND (
             $2::text IS NULL
@@ -460,12 +411,12 @@ export default {
           )
           AND fiscal_year >= EXTRACT(YEAR FROM CURRENT_DATE)::int - ($3::int - 1)
         ORDER BY fiscal_year DESC, pop_current_end_date DESC NULLS LAST, piid DESC
-        LIMIT $4`;
+        LIMIT $4\`;
 
       const client = makeClient(env);
       try {
         await client.connect();
-        await client.query(`SET statement_timeout = '20s'`);
+        await client.query(\`SET statement_timeout = '20s'\`);
         const { rows } = await queryPreferringFast(client, mkSQL, [uei, agency || null, years, limit]);
         return new Response(JSON.stringify({ ok: true, rows }), {
           status: 200, headers: { ...headers, "Content-Type": "application/json" },
@@ -503,9 +454,9 @@ export default {
       const client = makeClient(env);
       try {
         await client.connect();
-        await client.query(`SET statement_timeout = '20s'`);
+        await client.query(\`SET statement_timeout = '20s'\`);
 
-        const mkSQL = (t) => `
+        const mkSQL = (t) => \`
           SELECT
             award_id_piid,
             awarding_agency_name,
@@ -525,10 +476,10 @@ export default {
             number_of_offers_received,
             extent_competed,
             title
-          FROM ${t}
+          FROM \${t}
           WHERE award_id_piid = $1
           ORDER BY pop_current_end_date DESC
-          LIMIT 1`;
+          LIMIT 1\`;
 
         const aRes = await queryPreferringFast(client, mkSQL, [piid]);
         if (!aRes.rows.length) {
@@ -567,15 +518,15 @@ export default {
         let subs = { count: 0, distinctRecipients: 0, totalAmount: 0, top: [] };
         try {
           const s = await client.query(
-            `SELECT subawardee_name, subawardee_uei, subaward_amount
+            \`SELECT subawardee_name, subawardee_uei, subaward_amount
                FROM public.usaspending_contract_subawards
-              WHERE prime_award_piid = $1`,
+              WHERE prime_award_piid = $1\`,
             [piid]
           );
           const map = new Map();
           for (const r of s.rows || []) {
             const name = r.subawardee_name || "(Unnamed subrecipient)";
-            const key = `${r.subawardee_uei || "NOUEI"}|${name}`;
+            const key = \`\${r.subawardee_uei || "NOUEI"}|\${name}\`;
             const prev = map.get(key) || { name, uei: r.subawardee_uei || null, amount: 0 };
             prev.amount += Number(r.subaward_amount || 0);
             map.set(key, prev);
@@ -670,9 +621,9 @@ export default {
       const client = makeClient(env);
       try {
         await client.connect();
-        await client.query(`SET statement_timeout = '20s'`);
+        await client.query(\`SET statement_timeout = '20s'\`);
 
-        const sumSQL = `
+        const sumSQL = \`
           SELECT
             piid,
             pop_start          AS pop_start,
@@ -682,22 +633,22 @@ export default {
             potential_total_value_of_award_num    AS potential_total_value_of_award
           FROM fp.contract_award_summary_v
           WHERE piid = $1
-          LIMIT 1`;
+          LIMIT 1\`;
         const sumRes = await client.query(sumSQL, [piid]);
         if (!sumRes.rows.length) {
           return new Response(
-            JSON.stringify({ ok: false, error: `No award found for PIID ${piid}` }),
+            JSON.stringify({ ok: false, error: \`No award found for PIID \${piid}\` }),
             { status: 404, headers: { ...headers, "Content-Type": "application/json" } }
           );
         }
         const s = sumRes.rows[0];
 
-        const txSQL = `
+        const txSQL = \`
           SELECT action_date, obligation, modification_number, action_type, transaction_description
             FROM fp.contract_txn_min_v1
            WHERE piid = $1
            ORDER BY action_date ASC
-           LIMIT 5000`;
+           LIMIT 5000\`;
         const txRes = await client.query(txSQL, [piid]);
 
         const spendPoints = (txRes.rows || []).map((r) => ({
@@ -760,7 +711,7 @@ export default {
           status: 400, headers: { ...headers, "Content-Type": "application/json" },
         });
       }
-      const r = await fetch(`${url.origin}/sb/usa-contract?piid=${encodeURIComponent(piid)}`);
+      const r = await fetch(\`\${url.origin}/sb/usa-contract?piid=\${encodeURIComponent(piid)}\`);
       const j = await r.json().catch(() => ({}));
       if (!r.ok || !j || j.ok !== true) {
         return new Response(
@@ -791,7 +742,7 @@ export default {
           status: 400, headers: { ...headers, "Content-Type": "application/json" },
         });
       }
-      const r = await fetch(`${url.origin}/sb/usa-contract?piid=${encodeURIComponent(piid)}`);
+      const r = await fetch(\`\${url.origin}/sb/usa-contract?piid=\${encodeURIComponent(piid)}\`);
       const j = await r.json().catch(() => ({}));
       if (!r.ok || !j || j.ok !== true) {
         return new Response(
@@ -825,7 +776,7 @@ export default {
         for (const raw of list || []) {
           const s = String(raw || "").toUpperCase();
           if (!s) continue;
-          if (/\b8\s*\(?A\)?/.test(s) || s.includes("8(A)")) out.add("8(A)");
+          if (/\\b8\\s*\\(?A\\)?/.test(s) || s.includes("8(A)")) out.add("8(A)");
           if (s.includes("SDVOSB") || s.includes("SERVICE-DISABLED")) out.add("SDVOSB");
           if (s.includes("WOSB") || s.includes("WOMEN")) out.add("WOSB");
           if (s.includes("HUBZONE")) out.add("HUBZONE");
@@ -838,20 +789,20 @@ export default {
       const client = makeClient(env);
       try {
         await client.connect();
-        await client.query(`SET statement_timeout = '20s'`);
+        await client.query(\`SET statement_timeout = '20s'\`);
 
         // Base fallbacks from awards (name + NAICS)
-        const mkName = (t) => `
+        const mkName = (t) => \`
           SELECT recipient_name
-            FROM ${t}
+            FROM \${t}
            WHERE recipient_uei = $1
            ORDER BY total_dollars_obligated_num DESC NULLS LAST
-           LIMIT 1`;
-        const mkNaics = (t) => `
+           LIMIT 1\`;
+        const mkNaics = (t) => \`
           SELECT DISTINCT naics_code
-            FROM ${t}
+            FROM \${t}
            WHERE recipient_uei = $1 AND naics_code IS NOT NULL
-           LIMIT 200`;
+           LIMIT 200\`;
 
         let name = null;
         let naics = [];
@@ -869,12 +820,12 @@ export default {
         let smallBizCategories = [];
         try {
           const sba = await client.query(
-            `SELECT uei, business_name, website,
+            \`SELECT uei, business_name, website,
                     capabilities_narrative, capabilities_statement_link,
                     smallbiz_categories, naics_codes, active_sba_certifications_raw
                FROM sba.smallbiz_v
               WHERE upper(uei) = $1
-              LIMIT 1`,
+              LIMIT 1\`,
             [uei]
           );
           if (sba.rows.length) {
@@ -931,7 +882,7 @@ export default {
       }
     }
 
-    /* -------------------- fit/capability (POST): compare caps vs incumbent + transactions) -------------------- */
+    /* -------------------- fit/capability (POST): cosine-based match) -------------------- */
     if (request.method === "POST" && last === "capability" && segments[segments.length - 2] === "fit") {
       let body = {};
       try { body = await request.json(); } catch { body = {}; }
@@ -943,23 +894,23 @@ export default {
         });
       }
 
-      // Optional tunable weights (default TX-heavy)
-      const W_INC = Math.max(0, Math.min(30, Number(body?.weights?.inc_vs_my ?? 12)));
-      const W_TX  = Math.max(0, Math.min(30 - W_INC, Number(body?.weights?.my_vs_tx ?? 18)));
+      // Optional tunable weights (default 18 + 12 = 30 total)
+      const W_INC = Math.max(0, Math.min(30, Number(body?.weights?.inc_vs_my ?? 18)));
+      const W_TX  = Math.max(0, Math.min(30 - W_INC, Number(body?.weights?.my_vs_tx ?? 12)));
       const P_MAX = 30;
 
       const client = makeClient(env);
       try {
         await client.connect();
-        await client.query(`SET statement_timeout = '20s'`);
+        await client.query(\`SET statement_timeout = '20s'\`);
 
         // Find incumbent UEI for this PIID
-        const mkA = (t) => `
+        const mkA = (t) => \`
           SELECT recipient_uei, recipient_name
-            FROM ${t}
+            FROM \${t}
            WHERE award_id_piid = $1
            ORDER BY pop_current_end_date DESC NULLS LAST
-           LIMIT 1`;
+           LIMIT 1\`;
         const a = await queryPreferringFast(client, mkA, [piid]);
         const incUEI = (a.rows[0] && a.rows[0].recipient_uei) || null;
 
@@ -967,9 +918,9 @@ export default {
         let myCaps = "", incCaps = "";
         if (incUEI) {
           const capsRes = await client.query(
-            `SELECT uei, capabilities_narrative
+            \`SELECT uei, capabilities_narrative
                FROM sba.smallbiz_v
-              WHERE upper(uei) = ANY($1)`,
+              WHERE upper(uei) = ANY($1)\`,
             [[uei, String(incUEI).toUpperCase()]]
           );
           for (const r of capsRes.rows || []) {
@@ -978,10 +929,10 @@ export default {
           }
         } else {
           const capsRes = await client.query(
-            `SELECT uei, capabilities_narrative
+            \`SELECT uei, capabilities_narrative
                FROM sba.smallbiz_v
               WHERE upper(uei) = $1
-              LIMIT 1`,
+              LIMIT 1\`,
             [uei]
           );
           if (capsRes.rows.length) myCaps = capsRes.rows[0].capabilities_narrative || "";
@@ -989,27 +940,27 @@ export default {
 
         // Pull all transaction descriptions (concat)
         const tx = await client.query(
-          `SELECT transaction_description
+          \`SELECT transaction_description
              FROM fp.contract_txn_min_v1
             WHERE piid = $1
               AND transaction_description IS NOT NULL
-            LIMIT 5000`,
+            LIMIT 5000\`,
           [piid]
         );
         const txnBlob = (tx.rows || []).map((r) => String(r.transaction_description || "")).join(" ");
 
-        // Cosine signals
+        // Unified cosine scoring
         const mineBag = bag(tokenize(myCaps || ""));
         const incBag  = bag(tokenize(incCaps || ""));
         const txBag   = bag(tokenize(txnBlob || ""));
 
         let inc01 = (myCaps && incCaps) ? cosineFromBags(mineBag, incBag) : 0;
         if (incUEI && uei && incUEI.toUpperCase() === uei.toUpperCase() && myCaps) inc01 = 1; // same entity: perfect match
-        const tx01  = (myCaps && txnBlob) ? cosineFromBags(mineBag, txBag) : 0;
+        const tx01  = cosineFromBags(mineBag, txBag);      // 0..1
 
-        const inc5  = Math.round(inc01 * 5);
-        const tx5   = Math.round(tx01 * 5);
-        const combo = Math.round((inc01 + tx01) * 50);
+        const inc5         = Math.round(inc01 * 5);        // 0..5
+        const tx5          = Math.round(tx01 * 5);         // 0..5        
+        const combo        = Math.round((inc01 + tx01) * 50);
 
         // Map to a unified 0..30 bonus using weights
         const incPoints = Math.round(inc01 * W_INC);
@@ -1048,7 +999,6 @@ export default {
               combined_0to100: combo,
             },
             bonus_0to30: capPoints,
-            weights: { W_TX, W_INC },
             shared_keywords: { sharedInc, sharedTx },
           }),
           { status: 200, headers: { ...headers, "Content-Type": "application/json" } }
@@ -1056,425 +1006,6 @@ export default {
       } catch (e) {
         return new Response(
           JSON.stringify({ ok: false, error: (e && e.message) || "capability fit failed" }),
-          { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
-        );
-      } finally {
-        try { await client.end(); } catch {}
-      }
-    }
-
-    /* -------------------- bid-nobid (prefers actual set-aside; compares to SBA tags) -------------------- */
-    if (last === "bid-nobid") {
-      const piid = (url.searchParams.get("piid") || "").trim().toUpperCase();
-      const uei  = (url.searchParams.get("uei")  || "").trim().toUpperCase();
-      const years = Math.max(1, Math.min(10, parseInt(url.searchParams.get("years") || "5", 10)));
-      if (!piid || !uei) {
-        return new Response(
-          JSON.stringify({ ok: false, error: "Missing piid or uei" }),
-          { status: 400, headers: { ...headers, "Content-Type": "application/json" } }
-        );
-      }
-
-      const client = makeClient(env);
-      try {
-        await client.connect();
-        await client.query(`SET statement_timeout = '20s'`);
-
-        const mkAward = (t) => `
-          SELECT award_id_piid, naics_code, naics_description,
-                 awarding_agency_name, awarding_sub_agency_name, awarding_office_name,
-                 recipient_uei, recipient_name,
-                 total_dollars_obligated_num AS obligated,
-                 potential_total_value_of_award_num AS ceiling,
-                 pop_current_end_date,
-                 type_of_set_aside,
-                 number_of_offers_received
-            FROM ${t}
-           WHERE award_id_piid = $1
-           ORDER BY pop_current_end_date DESC NULLS LAST
-           LIMIT 1`;
-
-        const award = await queryPreferringFast(client, mkAward, [piid]);
-        if (!award.rows.length) {
-          return new Response(
-            JSON.stringify({ ok: false, error: "PIID not found" }),
-            { status: 404, headers: { ...headers, "Content-Type": "application/json" } }
-          );
-        }
-        const A = award.rows[0];
-        const orgName = A.awarding_sub_agency_name || A.awarding_office_name || A.awarding_agency_name;
-        const naics = A.naics_code;
-        const offersRaw = (A.number_of_offers_received == null ? "" : String(A.number_of_offers_received)).trim();
-        const offersNum = offersRaw && !Number.isNaN(Number(offersRaw)) ? Number(offersRaw) : null;
-        const actualSA  = (A.type_of_set_aside || "").toString().toUpperCase();
-
-        // Pull your SBA-enriched entity (includes smallBizCategories + naics)
-        const myEnt = await fetchJSON(`${url.origin}/sb/my-entity?uei=${encodeURIComponent(uei)}`).catch(() => ({}));
-        const myNAICS = (myEnt && myEnt.entity && myEnt.entity.naics) || [];
-        const mySocio = (myEnt && myEnt.entity && myEnt.entity.smallBizCategories) || [];
-
-        const mkMyAwards = (t) => `
-          SELECT COUNT(*)::int AS cnt, COALESCE(SUM(total_dollars_obligated_num),0)::float8 AS obligated
-            FROM ${t}
-           WHERE recipient_uei = $1
-             AND (
-               $2::text IS NULL OR awarding_agency_name=$2
-               OR awarding_sub_agency_name=$2 OR awarding_office_name=$2
-             )
-             AND fiscal_year >= EXTRACT(YEAR FROM CURRENT_DATE)::int - ($3::int - 1)`;
-        const myAwards = await queryPreferringFast(client, mkMyAwards, [uei, orgName, years]);
-
-        const mkInc = (t) => `
-          SELECT COUNT(*)::int AS cnt, COALESCE(SUM(total_dollars_obligated_num),0)::float8 AS obligated
-            FROM ${t}
-           WHERE recipient_uei = $1
-             AND (
-               $2::text IS NULL OR awarding_agency_name=$2
-               OR awarding_sub_agency_name=$2 OR awarding_office_name=$2
-             )
-             AND fiscal_year >= EXTRACT(YEAR FROM CURRENT_DATE)::int - ($3::int - 1)`;
-        const inc = await queryPreferringFast(client, mkInc, [A.recipient_uei, orgName, years]);
-
-        const mkDist = (t) => `
-          WITH base AS (
-            SELECT total_dollars_obligated_num AS obligated
-              FROM ${t}
-             WHERE naics_code = $1
-               AND (
-                 $2::text IS NULL OR awarding_agency_name=$2
-                 OR awarding_sub_agency_name=$2 OR awarding_office_name=$2
-               )
-               AND fiscal_year >= EXTRACT(YEAR FROM CURRENT_DATE)::int - ($3::int - 1)
-               AND total_dollars_obligated_num IS NOT NULL
-          )
-          SELECT
-            percentile_cont(0.25) WITHIN GROUP (ORDER BY obligated)::float8 AS p25,
-            percentile_cont(0.50) WITHIN GROUP (ORDER BY obligated)::float8 AS p50,
-            percentile_cont(0.75) WITHIN GROUP (ORDER BY obligated)::float8 AS p75
-            FROM base`;
-        const dist = await queryPreferringFast(client, mkDist, [naics, orgName, years]);
-        const P = (dist && dist.rows && dist.rows[0]) || { p25: null, p50: null, p75: null };
-
-        const toNum = (x) => (typeof x === "number" ? x : x == null ? 0 : Number(x) || 0);
-        const meCnt = toNum(myAwards.rows[0] && myAwards.rows[0].cnt);
-        const meObl = toNum(myAwards.rows[0] && myAwards.rows[0].obligated);
-        const incCnt = toNum(inc.rows[0] && inc.rows[0].cnt);
-        const today = new Date();
-        const dEnd = A.pop_current_end_date ? new Date(A.pop_current_end_date) : null;
-        const daysToEnd = dEnd ? Math.round((dEnd.getTime() - today.getTime()) / 86400000) : null;
-        const burn = A.ceiling && A.ceiling > 0 ? Math.round((toNum(A.obligated) / toNum(A.ceiling)) * 100) : null;
-
-        // Scoring
-        const tech = myNAICS.includes(naics)
-          ? 5
-          : myNAICS.some((c) => (c || "").slice(0, 3) === String(naics).slice(0, 3))
-          ? 4
-          : 2;
-        const pp = meCnt >= 3 || meObl >= 2000000 ? 5 : meCnt >= 1 ? 3 : 1;
-
-        let staffing = 3;
-        if (P.p50) {
-          const contractSize = toNum(A.obligated || A.ceiling || 0);
-          staffing = contractSize <= P.p50 ? 5 : contractSize <= (P.p75 || P.p50) ? 4 : 2;
-        }
-        let sched = 3;
-        if (daysToEnd != null && burn != null) {
-          if (daysToEnd > 180 && burn < 70) sched = 5;
-          else if (daysToEnd < 60 || burn > 90) sched = 2;
-          else sched = 3;
-        }
-
-        const haveMatch = (tag) => (mySocio || []).some((s) => String(s).toUpperCase().includes(tag));
-        const mkSA = (t) => `
-          SELECT MAX(type_of_set_aside) AS example_set_aside
-            FROM ${t}
-           WHERE naics_code=$1
-             AND (
-               $2::text IS NULL OR awarding_agency_name=$2
-               OR awarding_sub_agency_name=$2 OR awarding_office_name=$2
-             )
-             AND fiscal_year >= EXTRACT(YEAR FROM CURRENT_DATE)::int - ($3::int - 1)`;
-        const histSA = await queryPreferringFast(client, mkSA, [naics, orgName, years]);
-        const histExample = ((histSA.rows[0] && histSA.rows[0].example_set_aside) || "").toUpperCase();
-        const saUsed = actualSA || histExample;
-
-        let compliance = 3;
-        if (saUsed) {
-          if (saUsed.includes("8(A)"))                     compliance = haveMatch("8(A)")    ? 5 : 2;
-          else if (saUsed.includes("SDVOSB") || saUsed.includes("SERVICE-DISABLED"))
-                                                           compliance = haveMatch("SDVOSB") ? 5 : 2;
-          else if (saUsed.includes("WOSB") || saUsed.includes("WOMEN"))
-                                                           compliance = haveMatch("WOSB")   ? 5 : 2;
-          else if (saUsed.includes("HUBZONE"))             compliance = haveMatch("HUBZONE")? 5 : 2;
-          else if (saUsed.includes("SMALL"))               compliance = 4;
-          else                                             compliance = 3;
-        }
-
-        let price = 3;
-        if (P.p25 && P.p50 && P.p75) {
-          const val = toNum(A.obligated || A.ceiling || 0);
-          if (val <= P.p25) price = 4;
-          else if (val <= P.p50) price = 5;
-          else if (val <= P.p75) price = 3;
-          else price = 2;
-        }
-
-        let intel = incCnt === 0 ? 5 : incCnt <= 2 ? 4 : incCnt <= 5 ? 3 : 2;
-        if (offersNum != null) {
-          if (offersNum >= 10) intel = Math.min(intel, 2);
-          else if (offersNum >= 5) intel = Math.min(intel, 3);
-        }
-
-        const W = { tech: 24, pp: 20, staff: 12, sched: 8, compliance: 12, price: 8, intimacy: 8, intel: 8 };
-        const intimacy = meCnt >= 3 ? 5 : meCnt === 2 ? 4 : meCnt === 1 ? 3 : 1;
-
-        const weighted =
-          Math.round(
-            (W.tech * (tech / 5) +
-             W.pp * (pp / 5) +
-             W.staff * (staffing / 5) +
-             W.sched * (sched / 5) +
-             W.compliance * (compliance / 5) +
-             W.price * (price / 5) +
-             W.intimacy * (intimacy / 5) +
-             W.intel * (intel / 5)) *
-            10
-          ) / 10;
-        const decision = weighted >= 80 ? "bid" : weighted >= 65 ? "conditional" : "no_bid";
-
-        return new Response(
-          JSON.stringify({
-            ok: true,
-            inputs: { piid, uei, org: orgName, naics, set_aside: saUsed },
-            criteria: [
-              { name: "Technical Fit", weight: W.tech, score: tech, reason: myNAICS.includes(naics) ? "Exact NAICS match" : myNAICS.some((c) => (c || "").slice(0, 3) === String(naics).slice(0, 3)) ? "Related NAICS family" : "No NAICS match" },
-              { name: "Relevant Experience / Past Performance", weight: W.pp, score: pp, reason: `Your awards at this org: ${meCnt}; $${Math.round(meObl).toLocaleString()}` },
-              { name: "Staffing & Key Personnel", weight: W.staff, score: staffing, reason: "Proxy via local award size distribution" },
-              { name: "Schedule / ATO Timeline Risk", weight: W.sched, score: sched, reason: `Days to end: ${daysToEnd ?? "unknown"}; burn: ${burn ?? "unknown"}%` },
-              { name: "Compliance (Set-Aside Eligibility)", weight: W.compliance, score: compliance, reason: saUsed ? `Set-aside: ${saUsed}; your tags: ${(mySocio || []).join(", ") || "none"}` : "Set-aside unknown" },
-              { name: "Price Competitiveness", weight: W.price, score: price, reason: "Position vs NAICS@org percentiles" },
-              { name: "Customer Intimacy", weight: W.intimacy, score: intimacy, reason: `Your awards at this org: ${meCnt}` },
-              { name: "Competitive Intelligence", weight: W.intel, score: intel, reason: `Incumbent awards: ${incCnt}${offersNum!=null ? `; offers: ${offersNum}` : ""}` },
-            ],
-            weighted_percent: weighted,
-            decision,
-          }),
-          { status: 200, headers: { ...headers, "Content-Type": "application/json" } }
-        );
-      } catch (e) {
-        return new Response(
-          JSON.stringify({ ok: false, error: (e && e.message) || "bid-nobid failed" }),
-          { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
-        );
-      } finally {
-        try { await client.end(); } catch {}
-      }
-    }
-
-    /* -------------------- bid-nobid-memo -------------------- */
-    if (last === "bid-nobid-memo") {
-      const piid = (url.searchParams.get("piid") || "").trim().toUpperCase();
-      const uei = (url.searchParams.get("uei") || "").trim().toUpperCase();
-      const years = (url.searchParams.get("years") || "5").trim();
-
-      if (!piid || !uei) {
-        return new Response(JSON.stringify({ ok: false, error: "Missing piid or uei" }), {
-          status: 400, headers: { ...headers, "Content-Type": "application/json" },
-        });
-      }
-
-      if (!env.OPENAI_API_KEY) {
-        return new Response(JSON.stringify({ ok: false, error: "OPENAI_API_KEY not set" }), {
-          status: 500, headers: { ...headers, "Content-Type": "application/json" },
-        });
-      }
-
-      const scorer = new URL(url.toString());
-      scorer.pathname = "/sb/bid-nobid";
-      scorer.search = `?piid=${encodeURIComponent(piid)}&uei=${encodeURIComponent(uei)}&years=${encodeURIComponent(years)}`;
-      const j = await fetchJSON(scorer.toString()).catch((e) => ({ ok: false, error: e && e.message }));
-
-      if (!j || j.ok !== true) {
-        return new Response(
-          JSON.stringify({ ok: false, error: (j && j.error) || "bid-nobid failed" }),
-          { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
-        );
-      }
-
-      const inputs = j.inputs || {};
-      const orgName = (inputs.org || "—").toString();
-      const naics = (inputs.naics || "—").toString();
-      const setAsideRaw = (inputs.set_aside || inputs.setAside || inputs.setAsideType || "NONE").toString().toUpperCase();
-      const decision = (j.decision || "—").toString();
-      const pct = String(j.weighted_percent ?? "—");
-
-      const NON_MENTION_SETASIDES = new Set([
-        "NONE", "N/A", "FULL AND OPEN", "FULL & OPEN",
-        "FULL AND OPEN COMPETITION", "UNRESTRICTED",
-      ]);
-
-      const lines = (j.criteria || [])
-        .map((c) => `${c.name} | weight ${c.weight}% | score ${c.score}/5 | ${c.reason || ""}`)
-        .join("\n");
-
-      const prompt = `
-You are the Bid/No-Bid Decision GPT for federal capture. Follow the rules exactly.
-
-GOAL
-Return:
-1) A decision line: BID / CONDITIONAL / NO-BID with percent.
-2) A 5–7 line executive memo that references ONLY the provided facts and scores.
-
-FACTS
-- PIID: ${inputs.piid || piid}
-- Org: ${orgName}
-- NAICS: ${naics}
-- Set-aside: ${setAsideRaw}
-- Model Decision: ${decision} (${pct}%)
-
-SCORED MATRIX (source of truth for reasoning)
-${lines}
-
-HARD RULES (must follow)
-- Do NOT invent details. If a fact is not present above, do not mention it.
-- Mention set-aside ONLY if it is explicitly a socio-economic restriction (e.g., 8(a), WOSB/EWOSB, SDVOSB, HUBZone, Small Business). 
-- If set-aside is one of: ${Array.from(NON_MENTION_SETASIDES).join(", ")} then do NOT mention any set-aside or socio-economic eligibility at all.
-- Never state Women-Owned, 8(a), HUBZone, SDVOSB, or Small Business unless set-aside explicitly includes it.
-- Reference numeric items (scores or amounts) that appear in the matrix or inputs (e.g., NAICS match, awards $, burn %, days to end, price percentile, incumbent strength).
-- Keep the memo concise (5–7 lines), specific, and free of fluff.
-
-OUTPUT FORMAT
-Decision: <BID / CONDITIONAL / NO-BID> (<percent>%)
-
-Executive Memo:
-<5–7 lines using only the facts and matrix>
-      `.trim();
-
-      const aiRes = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${env.OPENAI_API_KEY}` },
-        body: JSON.stringify({
-          model: "gpt-4.1-mini",
-          messages: [
-            { role: "system", content: "You are a federal capture strategist. Obey all hard rules and never invent facts." },
-            { role: "user", content: prompt },
-          ],
-          temperature: 0.2,
-          max_tokens: 900,
-        }),
-      });
-
-      const txt = await aiRes.text();
-      let memo = "";
-      try { memo = JSON.parse(txt).choices[0].message.content.trim() || ""; }
-      catch { memo = txt.slice(0, 3000); }
-
-      return new Response(JSON.stringify({ ok: true, ...j, memo }), {
-        status: 200, headers: { ...headers, "Content-Type": "application/json" },
-      });
-    }
-
-    /* -------------------- teaming-suggestions -------------------- */
-    if (last === "teaming-suggestions") {
-      let qp = {};
-      if (request.method === "POST") {
-        try { qp = await request.json(); } catch { qp = {}; }
-      } else {
-        const params = new URL(request.url).searchParams;
-        qp = Object.fromEntries(params.entries());
-      }
-      const piid = (qp.piid || "").toString().trim().toUpperCase();
-      const naics = (qp.naics || "").toString().trim();
-      const org = (qp.org || "").toString().trim();
-      const years = Math.max(1, Math.min(10, parseInt(qp.years || "3", 10)));
-      const limit = Math.max(3, Math.min(10, parseInt(qp.limit || "5", 10)));
-      const exclude = String(qp.exclude_ueis || "")
-        .split(",").map((s) => s.trim().toUpperCase()).filter(Boolean);
-
-      if (piid) {
-        const client0 = makeClient(env);
-        try {
-          await client0.connect();
-          await client0.query(`SET statement_timeout = '20s'`);
-          const mkInc = (t) => `SELECT recipient_uei FROM ${t} WHERE award_id_piid=$1 LIMIT 1`;
-          const r0 = await queryPreferringFast(client0, mkInc, [piid]);
-          const incUEI = r0.rows[0] && r0.rows[0].recipient_uei && r0.rows[0].recipient_uei.toUpperCase();
-          if (incUEI) exclude.push(incUEI);
-        } catch {} finally {
-          try { await client0.end(); } catch {}
-        }
-      }
-
-      const client = makeClient(env);
-      try {
-        await client.connect();
-        await client.query(`SET statement_timeout = '20s'`);
-
-        const mkSQL = (t) => `
-          WITH base AS (
-            SELECT
-              recipient_uei  AS uei,
-              recipient_name AS name,
-              COUNT(*)       AS awards,
-              COALESCE(SUM(total_dollars_obligated_num),0) AS obligated
-            FROM ${t}
-            WHERE ($1::text IS NULL OR naics_code = $1)
-              AND (
-                $2::text IS NULL OR awarding_agency_name=$2
-                OR awarding_sub_agency_name=$2 OR awarding_office_name=$2
-              )
-              AND fiscal_year >= EXTRACT(YEAR FROM CURRENT_DATE)::int - ($3::int - 1)
-              AND recipient_uei IS NOT NULL
-            GROUP BY recipient_uei, recipient_name
-          )
-          SELECT * FROM base
-          WHERE NOT (upper(uei) = ANY($4))
-          ORDER BY obligated ASC NULLS LAST, awards DESC
-          LIMIT $5`;
-
-        const params = [naics || null, org || null, years, exclude.length ? exclude : ["__NONE__"], limit * 2];
-        const base = await queryPreferringFast(client, mkSQL, params);
-
-        const out = [];
-        for (const b of base.rows) {
-          const mkA = (t) => `
-            SELECT award_id_piid AS piid, fiscal_year, naics_code AS naics,
-                   title, total_dollars_obligated_num AS obligated
-              FROM ${t}
-             WHERE recipient_uei = $1
-               AND ($2::text IS NULL OR naics_code=$2)
-               AND (
-                 $3::text IS NULL OR awarding_agency_name=$3
-                 OR awarding_sub_agency_name=$3 OR awarding_office_name=$3
-               )
-             ORDER BY fiscal_year DESC, pop_current_end_date DESC NULLS LAST
-             LIMIT 3`;
-          const a = await queryPreferringFast(client, mkA, [b.uei, naics || null, org || null]);
-          const website = await fetchVendorWebsiteByUEI(b.uei, env);
-          out.push({
-            uei: b.uei,
-            name: b.name,
-            set_aside: null,
-            obligated: Number(b.obligated || 0),
-            recent_awards: (a.rows || []).map((r) => ({
-              piid: r.piid,
-              fiscal_year: Number(r.fiscal_year),
-              naics: r.naics,
-              title: r.title,
-              obligated: Number(r.obligated || 0),
-            })),
-            website,
-            contact: null,
-          });
-          if (out.length >= limit) break;
-        }
-
-        return new Response(JSON.stringify({ ok: true, rows: out }), {
-          status: 200, headers: { ...headers, "Content-Type": "application/json" },
-        });
-      } catch (e) {
-        return new Response(
-          JSON.stringify({ ok: false, error: (e && e.message) || "teaming failed" }),
           { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
         );
       } finally {
@@ -1498,18 +1029,18 @@ Executive Memo:
       return types;
     }
     function coerceNaics(input) {
-      let arr = Array.isArray(input) ? input : String(input || "").split(/[\,\s]+/);
+      let arr = Array.isArray(input) ? input : String(input || "").split(/[\\,\\s]+/);
       return Array.from(
-        new Set(arr.map((s) => String(s).replace(/\D+/g, "")).filter((s) => s.length >= 2 && s.length <= 6))
+        new Set(arr.map((s) => String(s).replace(/\\D+/g, "")).filter((s) => s.length >= 2 && s.length <= 6))
       );
     }
     function fmtMDY(d) {
       const mm = String(d.getMonth() + 1).padStart(2, "0");
       const dd = String(d.getDate()).padStart(2, "0");
       const yyyy = d.getFullYear();
-      return `${mm}/${dd}/${yyyy}`;
+      return \`\${mm}/\${dd}/\${yyyy}\`;
     }
-    function isMDY(s) { return /^\d{2}\/\d{2}\/\d{4}$/.test(String(s || "")); }
+    function isMDY(s) { return /^\\d{2}\\/\\d{2}\\/\\d{4}$/.test(String(s || "")); }
     function buildSamURL(env, body) {
       const u = new URL("https://api.sam.gov/prod/opportunities/v2/search");
       if (!env.SAM_API_KEY) throw new Error("SAM_API_KEY is not configured");
