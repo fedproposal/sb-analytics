@@ -423,7 +423,8 @@ if (last === "cap-compare" && request.method === "POST") {
           status: 200,
           headers: { ...headers, "Content-Type": "application/json" },
         });
-      } catch (e) {
+      } 
+   catch (e) {
         return new Response(
           JSON.stringify({ ok: false, error: e?.message || "cap compare failed" }),
           { status: 500, headers: { ...headers, "Content-Type": "application/json" } }
@@ -1071,17 +1072,17 @@ if (last === "cap-compare" && request.method === "POST") {
         const txnBlob = (tx.rows || []).map((r) => String(r.transaction_description || "")).join(" ");
 
         // Unified cosine scoring (aligns with /sb/cap-compare)
-        const mineBag = bag(tokenize(myCaps));
-        const incBag  = bag(tokenize(incCaps));
-        const txBag   = bag(tokenize(txnBlob));
+const mineBag = bag(tokenize(mine.narrative || ""))
+const incBag  = bag(tokenize(inc.narrative || ""))
+const txBag   = bag(tokenize(txBlob || ""))
 
         let inc01 = (myCaps && incCaps) ? cosineFromBags(mineBag, incBag) : 0;
         if (incUEI && uei && incUEI.toUpperCase() === uei.toUpperCase() && myCaps) inc01 = 1; // same entity: perfect match
-        const tx01 = (myCaps && txnBlob) ? cosineFromBags(mineBag, txBag) : 0;
+const tx01  = cosineFromBags(mineBag, txBag)      // 0..1
 
-        const inc5  = Math.round(inc01 * 5);
-        const tx5   = Math.round(tx01 * 5);
-        const combo = Math.round((inc01 + tx01) * 50);
+const inc5         = Math.round(inc01 * 5)                             // 0..5
+const tx5          = Math.round(tx01 * 5)                              // 0..5        
+         const combo = Math.round((inc01 + tx01) * 50);
 
         // Map to a unified 0..30 bonus using weights
         const incPoints = Math.round(inc01 * W_INC);
